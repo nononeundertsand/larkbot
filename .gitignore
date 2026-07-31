@@ -1,0 +1,18 @@
+# 敏感：LLM key、机器人凭证
+.env
+
+# 对话记忆（含聊天内容、用户信息，勿提交）
+data/
+
+# 日志
+*.log
+
+# 依赖与系统文件
+node_modules/
+.DS_Store
+
+# IDE / 本地上下文
+.trae/
+.lark-cli/
+.local/
+coverage/

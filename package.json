@@ -1,0 +1,9 @@
+{
+  "name": "larkbot-agent",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "for f in src/*.mjs; do node --check \"$f\" || exit 1; done",
+    "test": "node --test --test-concurrency=1"
+  }
+}
