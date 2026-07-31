@@ -101,6 +101,18 @@ async function resolvePersonToOpenId(name) {
   return { ok: true, candidates };
 }
 
+async function resolvePersonByEmail(email) {
+  const q = String(email || '').trim().toLowerCase();
+  if (!q) return { ok: false, reason: '缺少邮箱' };
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(q)) return { ok: false, reason: `邮箱格式不正确：${email}` };
+  const rp = await resolvePersonToOpenId(q);
+  if (!rp.ok) return { ok: false, reason: `通讯录里没找到邮箱「${email}」对应的用户` };
+  const exact = rp.candidates.filter((u) => String(u.email || '').trim().toLowerCase() === q);
+  if (exact.length === 0) return { ok: false, reason: `通讯录搜索到了候选人，但没有人的邮箱精确匹配「${email}」` };
+  if (exact.length > 1) return { ok: false, reason: `邮箱「${email}」匹配到多个用户，请检查通讯录数据` };
+  return { ok: true, user: exact[0] };
+}
+
 async function fetchChatMessages(chatId, { limit = 50, sort = 'desc', start = '' } = {}) {
   const max = Math.max(1, Math.min(200, Number(limit) || 50));
   const messages = [];
@@ -775,19 +787,20 @@ const TOOLS = [
     name: 'send_message',
     description:
       '以机器人身份代主人发送一条消息给某个人或当前群（写操作，需主人二次确认）。' +
-      '用于"帮我给张三发条消息说…""在群里通知一下…"。私发指定 to_user_name；发到当前群用 to_current_chat=true。',
+      '用于"帮我给张三发条消息说…""在群里通知一下…"。私发优先指定 to_user_email，可避免同名；也可用 to_user_name；发到当前群用 to_current_chat=true。',
     parameters: {
       type: 'object',
       properties: {
-        to_user_name: { type: 'string', description: '收件人姓名（私发），与 to_current_chat 二选一' },
-        to_current_chat: { type: 'boolean', description: '为 true 时发到当前群，与 to_user_name 二选一' },
+        to_user_name: { type: 'string', description: '收件人姓名（私发）；同名时会要求澄清' },
+        to_user_email: { type: 'string', description: '收件人邮箱（私发，推荐）；用于精确锁定同名用户' },
+        to_current_chat: { type: 'boolean', description: '为 true 时发到当前群；与 to_user_name/to_user_email 二选一' },
         text: { type: 'string', description: '纯文本内容（与 markdown 二选一）' },
         markdown: { type: 'string', description: 'markdown 内容（与 text 二选一）' },
       },
       required: [],
     },
     ownerOnly: true,
-    async run({ to_user_name, to_current_chat, text, markdown }, ctx) {
+    async run({ to_user_name, to_user_email, to_current_chat, text, markdown }, ctx) {
       if (!text && !markdown) return { error: '缺少消息内容' };
       const a = ['im', '+messages-send'];
       let who;
@@ -795,6 +808,11 @@ const TOOLS = [
         if (!ctx.chatId) return { error: '当前不是群聊，无法发到当前群' };
         a.push('--chat-id', ctx.chatId);
         who = '当前群';
+      } else if (to_user_email) {
+        const rp = await resolvePersonByEmail(to_user_email);
+        if (!rp.ok) return { error: `收件人邮箱「${to_user_email}」解析失败：${rp.reason}` };
+        a.push('--user-id', rp.user.openId);
+        who = `${rp.user.name || to_user_email}${rp.user.email ? `（${rp.user.email}）` : ''}`;
       } else if (to_user_name) {
         const rp = await resolvePersonToOpenId(to_user_name);
         if (!rp.ok) return { error: `收件人「${to_user_name}」解析失败：${rp.reason}` };

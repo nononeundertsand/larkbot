@@ -50,7 +50,7 @@
 | `web_search` / `web_fetch` | 联网搜索 / 抓取网页正文 | 公网 | 只读 |
 | `lookup_user` / `get_chat_members` / `get_user_recent_messages` / `summarize_chat` | 查人 / 群成员 / 消息 / 多页群聊总结（含有限图片识别） | 混合 | 只读 |
 
-> 一等写工具由代码固定拼参（含正确 `--as` 身份），比让 LLM 拼命令更可靠；参会人/受派人/收件人支持传**姓名**，工具内部用公共 `resolvePersonToOpenId` 自动解析成 ID/邮箱。
+> 一等写工具由代码固定拼参（含正确 `--as` 身份），比让 LLM 拼命令更可靠；参会人/受派人支持传**姓名**，私发消息推荐传**邮箱**以规避同名，工具内部会解析成 open_id。
 >
 > **网络访问**：`web_fetch`（抓正文供总结/问答）+ `web_search`（联网搜索，**provider 可切换**）。任何人可用（只读），带 **SSRF 防护**——仅 http/https、拒绝内网/本地/云元数据地址（含 DNS 解析后复查），防止借机器人探内网。
 > 搜索源用 `SEARCH_PROVIDER` 切换：

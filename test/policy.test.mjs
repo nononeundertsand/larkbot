@@ -42,6 +42,12 @@ test('主人可见授权卡片工具', () => {
   assert.equal(names.includes('start_user_auth'), true);
 });
 
+test('send_message 支持按邮箱精确指定私发收件人', () => {
+  const schema = getToolSchemas({ isOwner: true }).find((item) => item.function.name === 'send_message');
+  assert.ok(schema);
+  assert.ok(schema.function.parameters.properties.to_user_email);
+});
+
 test('auth/config/update 全局命令不追加身份参数', () => {
   assert.equal(__testing.supportsIdentityFlag(['auth', 'login', '--scope', 'calendar:calendar.event:read']), false);
   assert.equal(__testing.supportsIdentityFlag(['config', 'show']), false);
