@@ -24,18 +24,26 @@ import {
   maintainGroupMemory,
   flushMemory,
 } from './memory.mjs';
-import { getToolSchemas, getToolMetadata, executeTool, getRecentChatContext } from './tools.mjs';
+import { getToolSchemas, getToolMetadata, executeTool, getRecentChatContext, renderMessageContent } from './tools.mjs';
 import { runLark } from './lark.mjs';
 import { ApprovalStore } from './approval.mjs';
 import { SessionQueue } from './session-queue.mjs';
+import { formatLarkFailureForUser, formatLarkSuccessForUser } from './lark-errors.mjs';
+import { getOwnerName, getOwnerOpenId, initOwnerIdentity, isOwnerSender, maskId } from './owner.mjs';
+import { formatSafetyRefusal } from './safety-response.mjs';
+import { executeApprovedShellAction, formatShellResultForUser, shellDockerEnabled, shellEnabled } from './shell.mjs';
 
 const LARK_CLI = process.env.LARK_CLI_BIN || 'lark-cli';
 const EVENT_KEY = 'im.message.receive_v1';
 const IDENTITY = process.env.LARK_IDENTITY || 'bot'; // 回复身份：bot | user
 const RECONNECT_DELAY_MS = 3000;
 // 机器人主人（专属服务对象）的 open_id：其消息完全信任；其他人的请求要过安全评估。
-const OWNER_OPEN_ID = process.env.OWNER_OPEN_ID || '';
-const OWNER_NAME = process.env.OWNER_NAME || '主人';
+let OWNER_OPEN_ID = getOwnerOpenId();
+let OWNER_NAME = getOwnerName();
+function refreshOwnerIdentity() {
+  OWNER_OPEN_ID = getOwnerOpenId();
+  OWNER_NAME = getOwnerName();
+}
 // 限流防刷：单个发送者在滑动窗口内的最大请求数 + 全局并发上限。主人不受限。
 const RATE_WINDOW_MS = Number(process.env.RATE_WINDOW_MS || 60000); // 窗口 60s
 const RATE_MAX_PER_SENDER = Number(process.env.RATE_MAX_PER_SENDER || 5); // 每人每窗口 5 次
@@ -43,6 +51,8 @@ const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 3); // 全局同时�
 const LOG_CONTENT = (process.env.LOG_CONTENT || 'off').toLowerCase() === 'on';
 const GROUP_CONTEXT_PREFETCH = (process.env.GROUP_CONTEXT_PREFETCH || 'smart').toLowerCase(); // smart | on | off
 const GROUP_CONTEXT_LIMIT = Number(process.env.GROUP_CONTEXT_LIMIT || 15);
+const GROUP_CONTEXT_INCLUDE_IMAGES = (process.env.GROUP_CONTEXT_INCLUDE_IMAGES || 'on').toLowerCase() !== 'off';
+const CURRENT_MESSAGE_IMAGE_LIMIT = Number(process.env.CURRENT_MESSAGE_IMAGE_LIMIT || 3);
 
 function contentPreview(text) {
   const value = String(text || '');
@@ -56,6 +66,14 @@ function shouldPrefetchGroupContext(text) {
   const clean = String(text || '').trim();
   if (!clean) return true;
   return clean.length <= 40 || GROUP_CONTEXT_HINT_RE.test(clean);
+}
+
+async function renderCurrentMessageText(messageId, text, { includeImages = true } = {}) {
+  if (!includeImages) return String(text || '').replace(/\s+/g, ' ').trim();
+  return renderMessageContent(
+    { message_id: messageId, content: text },
+    { remaining: Math.max(0, Math.min(10, Number(CURRENT_MESSAGE_IMAGE_LIMIT) || 3)) },
+  );
 }
 
 // 机器人自身标识：用于判断「群里 @ 的是不是我」。
@@ -221,28 +239,6 @@ async function replyMessage(messageId, text) {
   return ok;
 }
 
-function larkFailureMessage(result) {
-  const raw = result?.json || (() => {
-    try { return JSON.parse(result?.out || ''); } catch { return null; }
-  })();
-  const error = raw?.error || {};
-  const code = error.code;
-  const message = String(error.message || result?.err || result?.out || '执行失败').trim();
-  if (code === 230013 || /NO availability/i.test(message)) {
-    return [
-      '执行失败：目标用户不在当前飞书应用/机器人的可用范围内，bot 不能给这个用户发私聊。',
-      '',
-      '处理方式：',
-      '1. 到飞书开放平台应用后台，把目标用户或其部门加入应用的可用范围/可见范围，并确认应用已发布或生效。',
-      '2. 如果是群内通知，改为发到当前群；bot 只要在群里通常可以发群消息。',
-      '3. `im +messages-send` 只支持 bot 身份，不能通过改成 `--as user` 兜底代发私聊。',
-      error.log_id ? `\nlog_id：${error.log_id}` : '',
-    ].filter(Boolean).join('\n');
-  }
-  const detail = message || JSON.stringify(raw || {}).slice(0, 300);
-  return `执行失败：${detail.slice(0, 500)}`;
-}
-
 // 统一的「问答（含写操作二次确认）」处理：
 //  - 主人若回复「确认 <确认码>」且有待执行的写命令 → 执行它
 //  - 主人若回复「取消」→ 放弃
@@ -252,10 +248,13 @@ async function runAgentWithConfirm(text, ctx, confirmationKey, isOwner) {
   if (decision.kind === 'execute') {
     const pending = decision.action;
     console.log(`[confirm] 执行 action=${pending.id?.slice(0, 8) || 'legacy'} tool=${pending.toolName || 'unknown'}`);
+    if (pending.executor === 'shell') {
+      const r = await executeApprovedShellAction(pending.shell);
+      return formatShellResultForUser(pending, r);
+    }
     const r = await runLark(pending.args);
-    if (r.code !== 0 || r.json?.ok === false) return larkFailureMessage(r);
-    const summary = String(pending.preview || '').split('\n')[0].replace(/^将/, '');
-    return `✅ 已执行${summary ? `：${summary}` : ''}。`;
+    if (r.code !== 0 || r.json?.ok === false) return formatLarkFailureForUser(r);
+    return formatLarkSuccessForUser(pending, r);
   }
   if (decision.kind === 'cancel') {
     return '好的，已取消该操作。';
@@ -310,7 +309,7 @@ async function handleEvent(evt) {
 
   // 识别来访者身份：是不是主人本人（真实姓名/部门延后到确认要响应时再解析，省请求）
   const senderId = d.sender_id || '';
-  const isOwner = senderId === OWNER_OPEN_ID;
+  const isOwner = isOwnerSender(senderId);
   let senderName = isOwner ? OWNER_NAME : '其他用户';
   let senderProfile = null;
   // 解析访客身份（姓名+部门），带缓存；填充 senderName / senderProfile
@@ -331,6 +330,9 @@ async function handleEvent(evt) {
       return;
     }
     const userText = stripMention(rawText, d.mentions);
+    const renderedUserText = await renderCurrentMessageText(messageId, userText, {
+      includeImages: GROUP_CONTEXT_INCLUDE_IMAGES,
+    });
 
     // 限流：访客受滑动窗口限制，主人不受限（限流在身份解析之前，省下被限流者的解析请求）
     if (!isOwner && isRateLimited(senderId)) {
@@ -338,15 +340,15 @@ async function handleEvent(evt) {
       return;
     }
     await resolveVisitor(); // 解析访客姓名+部门
-    console.log(`[recv] group@ ${whoLabel()} ${messageId} <- ${contentPreview(userText)}`);
+    console.log(`[recv] group@ ${whoLabel()} sender=${maskId(senderId)} msg=${messageId} <- ${contentPreview(renderedUserText)}`);
 
     // 安全闸（访客）：先挡明显的凭证索取 / 提示词注入等硬风险；
     // 更细的越权（查主人隐私等）由工具层的权限门禁精确控制。
     if (!isOwner) {
-      const { risky, reason } = await assessSafety(userText);
+      const { risky, reason } = await assessSafety(renderedUserText);
       if (risky) {
         console.warn(`[safety] ⚠️ 拒绝访客请求 ${messageId}：${reason}`);
-        const sent = await replyMessage(messageId, `抱歉，作为${OWNER_NAME}的专属助理，这个请求可能涉及${OWNER_NAME}的敏感或私密信息，我不能提供。如有需要请直接联系${OWNER_NAME}本人。`);
+        const sent = await replyMessage(messageId, formatSafetyRefusal({ text: renderedUserText, reason, ownerName: OWNER_NAME }));
         if (!sent) seen.delete(messageId);
         return;
       }
@@ -354,7 +356,7 @@ async function handleEvent(evt) {
 
     // 统一交给 Agent 编排：LLM 自主决定调用工具（查人/查消息/总结群聊/…）或直接对话。
     const gKey = sessionKey({ chatType, chatId: d.chat_id, senderId, senderName, senderDept: senderProfile?.department || '', senderEmail: senderProfile?.email || '' });
-    const qText = userText || '你好';
+    const qText = renderedUserText || '你好';
     const gCtx = buildContext(gKey, { persist: true, query: qText }); // 主人与访客均持久化三层记忆
     const sharedGroupCtx = buildGroupContext(d.chat_id, { persist: true, query: qText });
     let threadContext = '';
@@ -362,7 +364,7 @@ async function handleEvent(evt) {
       const recent = await getRecentChatContext(d.chat_id, {
         limit: GROUP_CONTEXT_LIMIT,
         messageId,
-        includeImages: false,
+        includeImages: GROUP_CONTEXT_INCLUDE_IMAGES,
       });
       if (recent.error) console.warn(`[context] 群聊上下文预取失败 ${messageId}: ${recent.error}`);
       else threadContext = recent.text || '';
@@ -397,22 +399,23 @@ async function handleEvent(evt) {
     return;
   }
   await resolveVisitor(); // 解析访客姓名+部门
-  console.log(`[recv] p2p ${whoLabel()} ${messageId} <- "${preview}"`);
+  const renderedRawText = await renderCurrentMessageText(messageId, rawText, { includeImages: true });
+  console.log(`[recv] p2p ${whoLabel()} sender=${maskId(senderId)} msg=${messageId} <- "${contentPreview(renderedRawText)}"`);
 
   // 安全闸（访客）：挡凭证索取/注入等硬风险；细粒度越权由工具权限门禁控制。
   if (!isOwner) {
-    const { risky, reason } = await assessSafety(rawText);
+    const { risky, reason } = await assessSafety(renderedRawText);
     if (risky) {
       console.warn(`[safety] ⚠️ 拒绝访客私聊请求 ${messageId}：${reason}`);
-      const sent = await replyMessage(messageId, `抱歉，作为${OWNER_NAME}的专属助理，这个请求可能涉及${OWNER_NAME}的敏感或私密信息，我不能提供。如有需要请直接联系${OWNER_NAME}本人。`);
+      const sent = await replyMessage(messageId, formatSafetyRefusal({ text: renderedRawText, reason, ownerName: OWNER_NAME }));
       if (!sent) seen.delete(messageId);
       return;
     }
   }
   // 统一交给 Agent 编排（私聊无群上下文，查群成员/群消息类工具会提示不可用；查人等仍可用）
   const pKey = sessionKey({ chatType, chatId: d.chat_id, senderId, senderName, senderDept: senderProfile?.department || '', senderEmail: senderProfile?.email || '' });
-  const pCtx = buildContext(pKey, { persist: true, query: rawText }); // 主人与访客均持久化三层记忆
-  const answer = await runAgentWithConfirm(rawText, {
+  const pCtx = buildContext(pKey, { persist: true, query: renderedRawText }); // 主人与访客均持久化三层记忆
+  const answer = await runAgentWithConfirm(renderedRawText, {
     isOwner, senderId, senderName, senderDept: senderProfile?.department || '', chatId: '', ...pCtx,
   }, pKey.id, isOwner);
   const sent = await replyMessage(messageId, answer);
@@ -420,7 +423,7 @@ async function handleEvent(evt) {
     seen.delete(messageId);
     return;
   }
-  appendTurn(pKey, rawText, answer, { persist: true });
+  appendTurn(pKey, renderedRawText, answer, { persist: true });
   maintainMemory(pKey).catch((e) => console.error('[memory] 维护异常：', e.message)); // 异步，不阻塞
 }
 
@@ -540,11 +543,14 @@ async function shutdown(signal) {
 process.once('SIGINT', () => { shutdown('SIGINT'); });
 process.once('SIGTERM', () => { shutdown('SIGTERM'); });
 
+await initOwnerIdentity(runLark);
+refreshOwnerIdentity();
 console.log('================ 飞书机器人自动回复 ================');
 console.log(`回复模式：${llmConfigured() ? '大模型问答 (' + (process.env.LLM_MODEL || 'default') + ')' : 'mock 回声（未配置 LLM）'}`);
-console.log(`专属主人：${OWNER_NAME}（${OWNER_OPEN_ID}）`);
-if (!OWNER_OPEN_ID) console.warn('[bot] ⚠️ 未配置 OWNER_OPEN_ID：所有人都会按访客处理，主人专属工具不可用。请在 .env 中配置。');
-console.log(`能力：Agent 工具编排（读 feishu-skill 文档自主调用 lark-cli：查人/群成员/消息/总结/日历/文档/任务…）`);
+console.log(`专属主人：${OWNER_NAME}（${maskId(OWNER_OPEN_ID)}）`);
+if (!OWNER_OPEN_ID) console.warn('[bot] ⚠️ 未配置 OWNER_OPEN_ID，且自动发现失败：所有人都会按访客处理，主人专属工具不可用。请在 .env 中配置 OWNER_OPEN_ID，或确认 lark-cli user 登录态有效。');
+console.log(`能力：Agent 工具编排（读最新版 lark-cli skills 文档自主调用 lark-cli：查人/群成员/消息/总结/日历/文档/任务…）`);
+console.log(`受限 Shell：${shellEnabled() ? `已启用 / runner=${shellDockerEnabled() ? 'docker' : 'local'}` : '未启用'}（默认关闭，仅主人可用）`);
 console.log(`群聊策略：仅 @机器人 时响应${IGNORE_BACKLOG ? '；忽略启动前的历史/积压消息' : ''}`);
 console.log(`安全策略：访客经安全评估(硬闸+防注入+fail-closed)；写操作仅主人且需回复带确认码的「确认 ABC123」；限流 ${RATE_MAX_PER_SENDER}次/${RATE_WINDOW_MS / 1000}s/人，并发上限 ${MAX_CONCURRENT}`);
 console.log(`对话记忆：短期滑动窗口(内存) + 长期摘要 + 关键JSON(按用户落盘 data/memory)；主人与访客均享完整三层`);

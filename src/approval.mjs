@@ -16,9 +16,11 @@ export class ApprovalStore {
   register(confirmationKey, action) {
     if (!confirmationKey) throw new Error('待确认操作缺少会话标识');
     const normalized = Array.isArray(action)
-      ? { id: '', toolName: 'legacy', args: action, preview: '' }
-      : action;
-    if (!Array.isArray(normalized?.args) || normalized.args.length === 0) {
+      ? { id: '', toolName: 'legacy', executor: 'lark', args: action, preview: '' }
+      : { executor: 'lark', ...action };
+    if (normalized.executor === 'shell') {
+      if (!normalized.shell?.command) throw new Error('待确认 Shell 操作缺少命令');
+    } else if (!Array.isArray(normalized?.args) || normalized.args.length === 0) {
       throw new Error('待确认写操作缺少命令参数');
     }
     this.pending.set(confirmationKey, {

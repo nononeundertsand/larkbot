@@ -16,6 +16,8 @@
 //   tools         是否支持 function calling（默认 true）
 //   vision        是否支持多模态图片（默认 false）
 //   maxTokensField  'max_tokens' | 'max_completion_tokens' | ''（不发）
+//   maxTokens     该模型默认输出 token 上限（调用显式 maxTokens 优先）
+//   extraBody     额外透传到 Chat Completions body 的 JSON 对象，如 Gemini thinking 配置
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 60000);
 
@@ -34,6 +36,28 @@ function parseTemperature(raw) {
   return Number.isFinite(n) ? n : undefined;
 }
 
+function parsePositiveInt(raw) {
+  if (raw == null || raw === '') return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+}
+
+function cloneJson(value) {
+  if (!value || typeof value !== 'object') return undefined;
+  try { return JSON.parse(JSON.stringify(value)); } catch { return undefined; }
+}
+
+function parseJsonObject(raw, label) {
+  if (!raw) return undefined;
+  try {
+    const obj = JSON.parse(raw);
+    return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : undefined;
+  } catch (e) {
+    console.error(`[models] ${label} 解析失败，忽略：`, e.message);
+    return undefined;
+  }
+}
+
 // 从全局 env 组一个「默认模型档案」（向后兼容：老配置只有 LLM_MODEL 也能跑）
 function defaultProfileFromEnv() {
   return {
@@ -48,6 +72,8 @@ function defaultProfileFromEnv() {
     tools: envBool(process.env.LLM_SUPPORTS_TOOLS, true),
     vision: envBool(process.env.LLM_SUPPORTS_VISION, true),
     maxTokensField: process.env.LLM_MAX_TOKENS_FIELD || 'max_tokens',
+    maxTokens: parsePositiveInt(process.env.LLM_MAX_TOKENS),
+    extraBody: parseJsonObject(process.env.LLM_EXTRA_BODY, 'LLM_EXTRA_BODY'),
   };
 }
 
@@ -75,6 +101,8 @@ function loadProfiles() {
         tools: 'tools' in item ? Boolean(item.tools) : base.tools,
         vision: 'vision' in item ? Boolean(item.vision) : base.vision,
         maxTokensField: item.maxTokensField ?? base.maxTokensField,
+        maxTokens: 'maxTokens' in item ? parsePositiveInt(item.maxTokens) : base.maxTokens,
+        extraBody: 'extraBody' in item ? cloneJson(item.extraBody) : cloneJson(base.extraBody),
       });
     }
   }
@@ -180,8 +208,17 @@ export function buildRequestBody(profile, { messages, tools, temperature, maxTok
     body.tool_choice = 'auto';
   }
   // max_tokens：字段名可配（GPT-5 系列用 max_completion_tokens）
-  if (maxTokens && profile.maxTokensField) {
-    body[profile.maxTokensField] = maxTokens;
+  const wantedMaxTokens = maxTokens ?? profile.maxTokens;
+  if (wantedMaxTokens && profile.maxTokensField) {
+    body[profile.maxTokensField] = wantedMaxTokens;
+  }
+  // 额外模型参数：例如 Gemini thinking。避免覆盖核心协议字段。
+  const extraBody = cloneJson(profile.extraBody);
+  if (extraBody) {
+    for (const [key, value] of Object.entries(extraBody)) {
+      if (['model', 'messages', 'tools', 'tool_choice'].includes(key)) continue;
+      if (!(key in body)) body[key] = value;
+    }
   }
   return body;
 }

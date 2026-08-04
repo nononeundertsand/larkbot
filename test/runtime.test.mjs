@@ -26,6 +26,73 @@ test('模糊同意词不会触发写操作，新请求会作废旧审批', () =>
   assert.equal(store.size(), 0);
 });
 
+test('审批状态机支持 Shell executor 动作', () => {
+  const store = new ApprovalStore({ ttlMs: 10000 });
+  store.register('p:owner', {
+    id: 's1',
+    toolName: 'run_shell_command',
+    executor: 'shell',
+    shell: { command: 'ls', args: ['src'], cwd: '.', purpose: '查看源码目录' },
+    preview: '执行 Shell',
+    confirmToken: 'SHELL1',
+  });
+  const result = store.resolve('p:owner', '确认 SHELL1', { isOwner: true });
+  assert.equal(result.kind, 'execute');
+  assert.equal(result.action.executor, 'shell');
+  assert.equal(result.action.shell.command, 'ls');
+});
+
+test('OWNER_OPEN_ID 为空时可从 lark-cli user 登录态自动发现主人', async () => {
+  const oldOpenId = process.env.OWNER_OPEN_ID;
+  const oldName = process.env.OWNER_NAME;
+  const oldAuto = process.env.OWNER_AUTO_DISCOVER;
+  delete process.env.OWNER_OPEN_ID;
+  delete process.env.OWNER_NAME;
+  process.env.OWNER_AUTO_DISCOVER = 'on';
+  try {
+    const owner = await import(`../src/owner.mjs?auto=${Date.now()}`);
+    await owner.initOwnerIdentity(async () => ({
+      code: 0,
+      json: {
+        data: {
+          identities: {
+            user: { openId: 'ou_auto_owner', userName: '自动主人' },
+          },
+        },
+      },
+    }), { logger: { log() {}, warn() {} } });
+    assert.equal(owner.getOwnerOpenId(), 'ou_auto_owner');
+    assert.equal(owner.getOwnerName(), '自动主人');
+    assert.equal(owner.isOwnerSender('ou_auto_owner'), true);
+  } finally {
+    if (oldOpenId === undefined) delete process.env.OWNER_OPEN_ID;
+    else process.env.OWNER_OPEN_ID = oldOpenId;
+    if (oldName === undefined) delete process.env.OWNER_NAME;
+    else process.env.OWNER_NAME = oldName;
+    if (oldAuto === undefined) delete process.env.OWNER_AUTO_DISCOVER;
+    else process.env.OWNER_AUTO_DISCOVER = oldAuto;
+  }
+});
+
+test('飞书 missing_scope 错误会格式化为可行动提示', async () => {
+  const { formatLarkFailureForTool } = await import('../src/lark-errors.mjs');
+  const result = formatLarkFailureForTool({
+    code: 1,
+    err: JSON.stringify({
+      ok: false,
+      error: {
+        type: 'authorization',
+        subtype: 'missing_scope',
+        message: 'missing scope',
+        missing_scopes: ['calendar:calendar.event:read'],
+        hint: 'run auth login',
+      },
+    }),
+  });
+  assert.match(result.error, /缺少飞书 user 授权/);
+  assert.deepEqual(result.larkError.missingScopes, ['calendar:calendar.event:read']);
+});
+
 test('lark-cli 子进程有超时保护', async () => {
   process.env.LARK_CLI_BIN = '/bin/sh';
   process.env.LARK_TIMEOUT_MS = '100';
@@ -136,6 +203,63 @@ test('结构化长期记忆按相关性检索并遗忘过期项', async () => {
     assert.doesNotMatch(ctx.memoryBrief, /咖啡/);
     assert.ok(ctx.summary.length < 700);
     assert.ok(ctx.history.length < 20);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('结构化记忆加载时清洗重复 key 前缀并合并同 key 记忆', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'larkbot-memory-prefix-'));
+  process.env.MEMORY_DATA_DIR = dir;
+  const groupDir = join(dir, 'groups');
+  mkdirSync(groupDir, { recursive: true });
+  writeFileSync(join(groupDir, 'group_oc_prefix.json'), JSON.stringify({
+    chatId: 'oc_prefix',
+    summary: '',
+    facts: {
+      member_roles: 'member_roles: member_roles: {"甲":"Owner"}',
+    },
+    memories: [
+      {
+        id: 'm1',
+        scope: 'group',
+        type: 'relationship',
+        source: 'llm',
+        key: 'member_roles',
+        content: 'member_roles: {"甲":"Owner"}',
+        confidence: 0.8,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        expiresAt: null,
+        useCount: 0,
+      },
+      {
+        id: 'm2',
+        scope: 'group',
+        type: 'preference',
+        source: 'llm',
+        key: 'member_roles',
+        content: 'member_roles: member_roles: {"甲":"Owner","乙":"Tester"}',
+        confidence: 0.8,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-02T00:00:00.000Z',
+        expiresAt: null,
+        useCount: 0,
+      },
+    ],
+    updatedAt: new Date().toISOString(),
+  }));
+
+  try {
+    const memory = await import(`../src/memory.mjs?prefix=${Date.now()}`);
+    const ctx = memory.buildGroupContext('oc_prefix', {
+      persist: true,
+      query: 'member_roles',
+      budgetChars: 2000,
+    });
+    assert.equal(ctx.groupMemories.filter((m) => m.key === 'member_roles').length, 1);
+    assert.equal(ctx.groupFacts.member_roles, '{"甲":"Owner","乙":"Tester"}');
+    assert.doesNotMatch(ctx.groupMemoryBrief, /member_roles:\s*member_roles/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

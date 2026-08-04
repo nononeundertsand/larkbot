@@ -7,6 +7,7 @@
 //   dataClass   public | group | private | system
 //   outputTrust trusted | external | private
 //   silentEgress 是否会在无需二次确认的情况下访问外部网络
+//   requiresCleanContext 是否禁止由外部/私密工具结果继续驱动该工具
 
 const DEFAULT_POLICY = Object.freeze({
   ownerOnly: false,
@@ -14,6 +15,7 @@ const DEFAULT_POLICY = Object.freeze({
   dataClass: 'public',
   outputTrust: 'trusted',
   silentEgress: false,
+  requiresCleanContext: false,
 });
 
 const TOOL_POLICIES = Object.freeze({
@@ -34,6 +36,9 @@ const TOOL_POLICIES = Object.freeze({
   web_fetch: { outputTrust: 'external', silentEgress: true },
   web_search: { outputTrust: 'external', silentEgress: true },
 
+  // 访客可用的安全代码执行：只在无挂载、无网络 Docker Python 沙箱中运行，输出视为不可信外部数据。
+  run_python_code: { dataClass: 'public', outputTrust: 'external' },
+
   list_lark_skills: { dataClass: 'system', outputTrust: 'trusted' },
   read_lark_skill: { dataClass: 'system', outputTrust: 'trusted' },
 
@@ -44,6 +49,14 @@ const TOOL_POLICIES = Object.freeze({
 
   // 元工具能力面过大，只允许主人使用；命令本身再做正向只读分类。
   run_lark_cli: { ownerOnly: true, dataClass: 'private', outputTrust: 'private' },
+
+  // Shell 能力比普通工具危险：仅主人可见，输出按私密数据处理，且不能由网页/群消息等不可信结果驱动。
+  run_shell_command: {
+    ownerOnly: true,
+    dataClass: 'private',
+    outputTrust: 'private',
+    requiresCleanContext: true,
+  },
 });
 
 // 只读判定采用 allowlist：无法确认只读的命令一律视为写操作并要求确认。
@@ -74,6 +87,18 @@ export function authorizeTool(name, _args, ctx = {}) {
 
 // 防止不可信网页/群消息驱动读取主人私有数据，也防止私有数据通过无需确认的网络工具外传。
 export function authorizeToolTransition(policy, state = {}) {
+  if (policy.requiresCleanContext && state.externalTaint) {
+    return {
+      ok: false,
+      reason: '为防止外部内容或群消息中的提示词注入诱导执行本机命令，请把 Shell 操作作为一条新的独立请求发给我。',
+    };
+  }
+  if (policy.requiresCleanContext && state.privateDataRead) {
+    return {
+      ok: false,
+      reason: '本轮已读取私密数据，出于防泄露考虑不能继续执行本机命令。请另起一条请求。',
+    };
+  }
   if (state.externalTaint && policy.dataClass === 'private' && policy.effect === 'read') {
     return {
       ok: false,

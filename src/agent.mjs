@@ -45,6 +45,7 @@ import {
 } from './reply.mjs';
 import { authorizeToolTransition, getToolPolicy } from './policy.mjs';
 import { randomUUID } from 'node:crypto';
+import { formatSafetyRefusal } from './safety-response.mjs';
 
 const MAX_ITERS = Number(process.env.AGENT_MAX_ITERS || 6);
 const MAX_TOOL_CALLS = Number(process.env.AGENT_MAX_TOOL_CALLS || 10);
@@ -121,6 +122,10 @@ function buildMessages(ctx, text, hasTools) {
   if (threadContext && String(threadContext).trim()) memoryNote += '\n【本次@之前的群聊上文】\n' + wrapMemoryData(String(threadContext).trim());
   const toolNote = hasTools
     ? '\n你可以调用提供的工具来查日程/任务/邮件、发消息、查通讯录、查群成员与消息、读群聊上下文、总结群聊等。' +
+      '如果用户消息或群聊上文中出现“【系统已读取并识别图片：...】”，这表示图片已经由多模态模型读取并转写成视觉描述；回答时应直接基于该视觉描述解释图片内容，不要再说“我看不到图片/只能看到占位符/只能想象”。' +
+      '如果工具列表中包含 run_python_code，且用户明确要求运行/执行/跑一段普通 Python 代码并查看输出，应优先调用 run_python_code 实际执行；访客也可以使用该安全 Python 沙箱。' +
+      '如果工具列表中包含 run_shell_command，且主人明确要求运行命令或 Python 代码，应优先调用该工具实际执行，不要声称没有代码执行工具，也不要凭空推演输出。' +
+      '运行 Python 代码时使用 run_shell_command 的 command="python3"、args=["-c", 代码字符串]；工具会负责 Docker/沙箱/确认策略。' +
       '需要实时数据或执行操作时优先调用工具，不要编造。' +
       '能一步查到就别绕路；工具返回 refused/error/needConfirm 时，如实、礼貌地转达给用户。'
     : '';
@@ -190,12 +195,13 @@ async function actNode(state, assistantMsg, executeTool, getToolMetadata) {
     const policy = getToolMetadata(name, args);
     const transition = authorizeToolTransition(policy, state);
     if (!transition.ok) {
-      state.messages.push({
-        role: 'tool',
-        tool_call_id: tc.id || name,
-        content: JSON.stringify({ refused: true, message: transition.reason }),
-      });
-      continue;
+      return {
+        needRefusalMsg: formatSafetyRefusal({
+          text: state.userText,
+          reason: transition.reason,
+          ownerName: OWNER_NAME,
+        }),
+      };
     }
 
     console.log(`[agent:${state.runId}] tool=${name} call=${state.toolCallCount}/${MAX_TOOL_CALLS}`);
@@ -206,6 +212,13 @@ async function actNode(state, assistantMsg, executeTool, getToolMetadata) {
       tool_call_id: tc.id || name,
       content: policy.outputTrust === 'trusted' ? serialized : wrapToolData(serialized),
     });
+    if (result?.refused) {
+      return {
+        needRefusalMsg: result.securityRefusal
+          ? result.message
+          : formatSafetyRefusal({ text: state.userText, reason: result.message || result.reason || '请求被安全策略拒绝', ownerName: OWNER_NAME }),
+      };
+    }
     if (!result?.error && !result?.refused) {
       if (policy.outputTrust === 'external') state.externalTaint = true;
       if (policy.dataClass === 'private' && policy.effect === 'read') state.privateDataRead = true;
@@ -256,6 +269,7 @@ export async function runAgent(userText, ctx = {}, deps = {}) {
     // 不会让同一次运行前后两轮用不同模型（否则 tool_calls 的 signature 串味，Gemini 会 400）。
     model: currentDefaultModelId(),
     messages: buildMessages(ctx, text, hasTools),
+    userText: text,
     iter: 0,
     lastAssistantContent: '',
     toolCallCount: 0,
@@ -282,6 +296,7 @@ export async function runAgent(userText, ctx = {}, deps = {}) {
 
       // guard 节点：写操作二次确认命中 → 立即短路，确定性把确认提示交给用户
       if (action.needConfirmMsg) return action.needConfirmMsg;
+      if (action.needRefusalMsg) return action.needRefusalMsg;
       if (action.exhausted) break;
 
       // observe：迭代计数，用尽则收敛

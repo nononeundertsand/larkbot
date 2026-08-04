@@ -43,6 +43,27 @@ test('max_tokens 字段名可按档案切换（GPT-5 用 max_completion_tokens�
   assert.equal('max_tokens' in body, false);
 });
 
+test('模型档案可透传默认 maxTokens 和 extraBody thinking', () => {
+  const p = {
+    id: 'gemini-3.1-p',
+    temperature: 'fixed',
+    maxTokensField: 'max_tokens',
+    maxTokens: 4096,
+    extraBody: {
+      thinking: { include_thoughts: true, budget_tokens: 2000 },
+      tools: [{ type: 'google_search' }],
+    },
+  };
+  const body = buildRequestBody(p, {
+    messages: [],
+    tools: [{ type: 'function', function: { name: 'x', parameters: { type: 'object' } } }],
+  });
+  assert.equal(body.max_tokens, 4096);
+  assert.deepEqual(body.thinking, { include_thoughts: true, budget_tokens: 2000 });
+  assert.equal(body.tool_choice, 'auto');
+  assert.equal(body.tools[0].type, 'function');
+});
+
 test('任务路由：vision/fast 指到指定模型，未配置回落默认', () => {
   assert.equal(resolveModelChain({ task: 'vision' })[0], 'gpt-5.6-sol');
   assert.equal(resolveModelChain({ task: 'fast' })[0], 'fast-mini');

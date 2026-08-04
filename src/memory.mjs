@@ -52,6 +52,19 @@ function clipText(value, maxChars) {
   if (!maxChars || s.length <= maxChars) return s;
   return s.slice(0, Math.max(0, maxChars - 20)) + '\n…（已按上下文预算截断）';
 }
+function escapeRe(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+function stripKeyPrefix(value, key) {
+  const s = String(value || '').trim();
+  const k = String(key || '').trim();
+  if (!k) return s;
+  return s.replace(new RegExp(`^(?:${escapeRe(k)}\\s*[:：]\\s*)+`, 'i'), '').trim();
+}
+function factValueToContent(key, value) {
+  const raw = typeof value === 'string' ? value : JSON.stringify(value);
+  return stripKeyPrefix(raw, key);
+}
 function tokenize(text) {
   const s = String(text || '').toLowerCase();
   const latin = s.match(/[a-z0-9_]{2,}/g) || [];
@@ -87,14 +100,15 @@ function factsToMemoryItems(facts, { scope = 'session', source = 'llm' } = {}) {
   return Object.entries(facts)
     .filter(([, value]) => value != null && String(value).trim())
     .map(([key, value]) => {
-      const type = inferMemoryType(key, value);
+      const content = factValueToContent(key, value);
+      const type = inferMemoryType(key, content);
       return {
         id: randomUUID(),
         scope,
         type,
         source,
         key: String(key),
-        content: `${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`,
+        content,
         confidence: source === 'legacy' ? 0.65 : 0.75,
         createdAt,
         updatedAt: createdAt,
@@ -108,15 +122,16 @@ function normalizeMemoryItems(rawItems, legacyFacts, { scope = 'session' } = {})
   const now = nowIso();
   const items = [];
   for (const item of Array.isArray(rawItems) ? rawItems : []) {
-    const content = memoryContent(item);
+    const key = String(item.key || '').trim();
+    const content = stripKeyPrefix(memoryContent(item), key);
     if (!content) continue;
-    const type = item.type || inferMemoryType(item.key || '', content);
+    const type = item.type || inferMemoryType(key, content);
     items.push({
       id: item.id || randomUUID(),
       scope: item.scope || scope,
       type,
       source: item.source || 'llm',
-      key: item.key || '',
+      key,
       content,
       confidence: Number.isFinite(Number(item.confidence)) ? Math.max(0, Math.min(1, Number(item.confidence))) : 0.7,
       createdAt: item.createdAt || item.updatedAt || now,
@@ -131,12 +146,19 @@ function normalizeMemoryItems(rawItems, legacyFacts, { scope = 'session' } = {})
 function mergeMemories(existing, incoming) {
   const byKey = new Map();
   for (const item of [...(existing || []), ...(incoming || [])]) {
-    const content = memoryContent(item);
+    const itemKey = String(item.key || '').trim();
+    const content = stripKeyPrefix(memoryContent(item), itemKey);
     if (!content) continue;
-    const key = `${item.scope || ''}|${item.type || ''}|${(item.key || content).toLowerCase()}`;
-    const prev = byKey.get(key);
-    if (!prev || timeMs(item.updatedAt) >= timeMs(prev.updatedAt)) {
-      byKey.set(key, { ...prev, ...item, content });
+    const type = item.type || inferMemoryType(itemKey, content);
+    const mergeKey = itemKey
+      ? `${item.scope || ''}|${itemKey.toLowerCase()}`
+      : `${item.scope || ''}|${type}|${content.toLowerCase()}`;
+    const prev = byKey.get(mergeKey);
+    if (prev && item.source === 'legacy' && prev.source !== 'legacy') {
+      continue;
+    }
+    if (!prev || prev.source === 'legacy' || timeMs(item.updatedAt) >= timeMs(prev.updatedAt)) {
+      byKey.set(mergeKey, { ...prev, ...item, key: itemKey, type, content });
     }
   }
   return [...byKey.values()];
@@ -199,13 +221,13 @@ function memoriesToFacts(items) {
   const facts = {};
   for (const item of items || []) {
     const key = item.key || `${item.type || 'memory'}_${Object.keys(facts).length + 1}`;
-    facts[key] = memoryContent(item);
+    facts[key] = stripKeyPrefix(memoryContent(item), key);
   }
   return facts;
 }
 function formatMemoryBrief(items) {
   return (items || [])
-    .map((m) => `- [${m.type || 'fact'}|${m.scope || 'session'}|${m.source || 'unknown'}|${Math.round((Number(m.confidence) || 0) * 100)}%] ${memoryContent(m)}`)
+    .map((m) => `- [${m.type || 'fact'}|${m.scope || 'session'}|${m.source || 'unknown'}|${Math.round((Number(m.confidence) || 0) * 100)}%] ${stripKeyPrefix(memoryContent(m), m.key)}`)
     .join('\n');
 }
 function clipHistory(messages, budgetChars) {
