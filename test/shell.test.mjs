@@ -148,6 +148,44 @@ test('apt 仅允许 Docker 内 download，不允许安装或 sudo', () => {
   }
 });
 
+test('curl/wget 仅允许 Docker 内公开 URL 下载到容器 tmp', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'larkbot-shell-download-'));
+  try {
+    withEnv({
+      SHELL_SANDBOX_ROOT: dir,
+      SHELL_DOCKER_ENABLED: 'on',
+      SHELL_DOCKER_IMAGE: 'larkbot-shell-sandbox:test',
+      SHELL_DOCKER_WORKSPACE_MODE: undefined,
+      SHELL_CONFIRM_ALL: undefined,
+    }, () => {
+      const curl = reviewShellCommand({ command: 'curl', args: ['-fL', '-O', 'https://example.com/file.tar.gz'], cwd: '.' });
+      assert.equal(curl.ok, true);
+      assert.equal(curl.requiresConfirmation, false);
+      assert.equal(curl.audit.dockerNetwork, 'bridge');
+      assert.equal(curl.audit.workspaceMounted, false);
+      const curlArgs = buildDockerRunArgs(curl);
+      assert.equal(curlArgs[curlArgs.indexOf('--network') + 1], 'bridge');
+      assert.equal(curlArgs.includes('-v'), false);
+      assert.equal(curlArgs[curlArgs.indexOf('--workdir') + 1], '/tmp');
+      assert.equal(curlArgs.at(-4), 'curl');
+      assert.equal(curlArgs.at(-3), '-fL');
+      assert.equal(curlArgs.at(-2), '-O');
+      assert.equal(curlArgs.at(-1), 'https://example.com/file.tar.gz');
+
+      const wget = reviewShellCommand({ command: 'wget', args: ['-O', 'file.tgz', 'https://example.com/file.tgz'], cwd: '.' });
+      assert.equal(wget.ok, true);
+      assert.equal(wget.audit.dockerNetwork, 'bridge');
+      assert.equal(wget.audit.workspaceMounted, false);
+
+      assert.match(reviewShellCommand({ command: 'curl', args: ['http://127.0.0.1:8080/x'], cwd: '.' }).reason, /内网|本地/);
+      assert.match(reviewShellCommand({ command: 'wget', args: ['--header=Authorization: Bearer x', 'https://example.com/a'], cwd: '.' }).reason, /allowlist/);
+      assert.match(reviewShellCommand({ command: 'curl', args: ['-o', '../x', 'https://example.com/a'], cwd: '.' }).reason, /路径穿越|不安全/);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('访客 Python 沙箱 Docker 参数不挂载 workspace', () => {
   withEnv({
     SHELL_DOCKER_ENABLED: 'on',

@@ -69,7 +69,7 @@
 > ```bash
 > docker build -f docker/shell-sandbox.Dockerfile -t larkbot-shell-sandbox:latest .
 > ```
-> 然后设置 `SHELL_ENABLED=on`、`SHELL_DOCKER_ENABLED=on`。此时所有 Shell 命令都会经 `docker run` 执行：`--network none`、`--read-only`、`--cap-drop ALL`、`--security-opt no-new-privileges`、非 root 用户、CPU/内存/PID 限制、项目目录默认只读挂载到 `/workspace`。即使命令触发隐藏攻击代码，也只能在容器环境和容器 `/tmp` 内执行，默认不能改本机项目文件或访问网络。Python 只在 Docker 只读 runner 中开放，支持 `python3 -c "<code>"` 或执行沙箱内 `.py` 文件；apt 只允许 `apt/apt-get download <包名>` 下载 `.deb` 到容器 `/tmp`，不允许 `sudo` 或 `apt install/update/upgrade`。
+> 然后设置 `SHELL_ENABLED=on`、`SHELL_DOCKER_ENABLED=on`。此时所有普通 Shell 命令都会经 `docker run` 执行：`--network none`、`--read-only`、`--cap-drop ALL`、`--security-opt no-new-privileges`、非 root 用户、CPU/内存/PID 限制、项目目录默认只读挂载到 `/workspace`。即使命令触发隐藏攻击代码，也只能在容器环境和容器 `/tmp` 内执行，默认不能改本机项目文件或访问网络。Python 只在 Docker 只读 runner 中开放，支持 `python3 -c "<code>"` 或执行沙箱内 `.py` 文件。下载类命令走专门的 Docker profile：`apt/apt-get download <包名>` 以及受限 `curl/wget` 公开 http/https URL 下载会使用 `network=bridge`、不挂载 workspace、执行目录固定为 `/tmp`；不允许 `sudo`、`apt install/update/upgrade` 或携带 header/post 等复杂联网参数。
 
 **元工具**（长尾兜底，仅主人可用）：
 - `list_lark_skills`：读路由表，判断该用哪个飞书域
@@ -198,7 +198,7 @@ tail -f /tmp/larkbot.log
 | `SHELL_TIMEOUT_MS` / `SHELL_MAX_OUTPUT_BYTES` | Shell | 单条命令超时（默认 10s）/ 输出上限（默认 50KB） |
 | `SHELL_CONFIRM_ALL` / `SHELL_ALLOW_PROJECT_COMMANDS` | Shell | 是否所有 Shell 命令都确认 / 是否允许 `npm test`、`npm run check`、`npm run test`；本机 runner 下默认全部确认 |
 | `SHELL_DOCKER_ENABLED` / `SHELL_DOCKER_IMAGE` | Shell | 是否用 Docker runner 执行所有 Shell 命令 / 镜像名（默认 `larkbot-shell-sandbox:latest`） |
-| `SHELL_DOCKER_WORKSPACE_MODE` / `SHELL_DOCKER_PULL` | Shell | workspace 挂载模式（默认 `ro`，不额外确认；`rw` 会重新要求确认）/ 镜像拉取策略（默认 `never`，避免执行时联网与漂移） |
+| `SHELL_DOCKER_WORKSPACE_MODE` / `SHELL_DOCKER_PULL` | Shell | workspace 挂载模式（默认 `ro`，不额外确认；`rw` 会重新要求确认）/ 镜像拉取策略（默认 `never`，避免执行时联网与漂移；下载命令的联网发生在容器运行时） |
 | `SHELL_DOCKER_CPUS` / `SHELL_DOCKER_MEMORY` / `SHELL_DOCKER_PIDS_LIMIT` | Shell | Docker 容器 CPU、内存和进程数限制，默认 `1` / `512m` / `128` |
 | `PYTHON_CODE_TIMEOUT_MS` / `PYTHON_CODE_MAX_CHARS` / `PYTHON_CODE_MAX_OUTPUT_BYTES` | Shell | 访客 Python 沙箱超时、代码长度和输出上限 |
 | `EVENT_QUEUE_MAX` | 事件 | 内存事件队列上限，默认 100；并发满时排队而非直接丢消息 |

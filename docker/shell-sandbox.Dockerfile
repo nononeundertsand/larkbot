@@ -4,12 +4,15 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     ca-certificates \
     coreutils \
+    curl \
     findutils \
     git \
     grep \
     python3 \
     python-is-python3 \
-    ripgrep
+    ripgrep \
+    wget \
+  && rm -rf /var/lib/apt/lists/*
 
 USER 1000:1000
 WORKDIR /workspace

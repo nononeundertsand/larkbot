@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { basename, isAbsolute, join, relative, resolve } from 'node:path';
+import { isIP } from 'node:net';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const PROJECT_ROOT = resolve(__dirname, '..');
@@ -14,9 +15,10 @@ const PYTHON_SANDBOX_WORKDIR = '/tmp';
 const READ_COMMANDS = new Set(['pwd', 'ls', 'find', 'rg', 'grep', 'cat', 'head', 'tail', 'wc', 'git']);
 const PYTHON_COMMANDS = new Set(['python', 'python3']);
 const APT_DOWNLOAD_COMMANDS = new Set(['apt', 'apt-get']);
+const URL_DOWNLOAD_COMMANDS = new Set(['curl', 'wget']);
 const FORBIDDEN_COMMANDS = new Set([
   'sh', 'bash', 'zsh', 'fish', 'osascript',
-  'curl', 'wget', 'nc', 'netcat', 'telnet', 'ssh', 'scp', 'sftp', 'rsync',
+  'nc', 'netcat', 'telnet', 'ssh', 'scp', 'sftp', 'rsync',
   'rm', 'mv', 'cp', 'dd', 'chmod', 'chown', 'sudo', 'su', 'kill', 'pkill',
   'docker', 'kubectl', 'terraform', 'ansible',
   'node', 'perl', 'ruby', 'php',
@@ -25,6 +27,26 @@ const GIT_READ_SUBCOMMANDS = new Set(['status', 'diff', 'show', 'log', 'branch',
 const NPM_ALLOWED = new Set(['test']);
 const NPM_RUN_ALLOWED = new Set(['check', 'test']);
 const APT_PACKAGE_RE = /^[a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+)?(?:=[a-zA-Z0-9:~+.-]+)?$/;
+const DOWNLOAD_OUTPUT_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,119}$/;
+const CURL_BOOLEAN_FLAGS = new Set([
+  '-f', '--fail',
+  '-L', '--location',
+  '-O', '--remote-name',
+  '-J', '--remote-header-name',
+  '-s', '--silent',
+  '-S', '--show-error',
+  '--compressed',
+]);
+const CURL_VALUE_FLAGS = new Set(['-o', '--output']);
+const CURL_NUMBER_FLAGS = new Set(['--max-redirs', '--connect-timeout', '--retry']);
+const WGET_BOOLEAN_FLAGS = new Set([
+  '-q', '--quiet',
+  '-S', '--server-response',
+  '-nv', '--no-verbose',
+  '--content-disposition',
+]);
+const WGET_VALUE_FLAGS = new Set(['-O', '--output-document']);
+const WGET_NUMBER_FLAGS = new Set(['--timeout', '--tries', '--max-redirect']);
 
 const SENSITIVE_ARG_RE =
   /(^|[/\\])(?:\.env(?:\..*)?|\.ssh|\.aws|\.kube|\.docker|id_rsa|id_ed25519|known_hosts|credentials?|secrets?|tokens?)([/\\]|$)/i;
@@ -120,6 +142,174 @@ function containsFlag(args, flagSet) {
   return args.some((arg) => flagSet.has(arg) || [...flagSet].some((flag) => arg.startsWith(`${flag}=`)));
 }
 
+function isPrivateIpv4(ip) {
+  const parts = ip.split('.').map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return true;
+  const [a, b, c] = parts;
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 192 && b === 0 && c === 0) ||
+    (a === 198 && (b === 18 || b === 19)) ||
+    a >= 224
+  );
+}
+
+function ipv4FromMappedIpv6(ip) {
+  const lower = String(ip || '').toLowerCase();
+  if (!lower.startsWith('::ffff:')) return '';
+  const tail = lower.slice('::ffff:'.length);
+  if (isIP(tail) === 4) return tail;
+  const parts = tail.split(':');
+  if (parts.length !== 2 || !parts.every((part) => /^[0-9a-f]{1,4}$/i.test(part))) return '';
+  const hi = Number.parseInt(parts[0], 16);
+  const lo = Number.parseInt(parts[1], 16);
+  return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+}
+
+function isPrivateIp(ip) {
+  const normalized = String(ip || '').toLowerCase().replace(/^\[|\]$/g, '');
+  const mapped = ipv4FromMappedIpv6(normalized);
+  if (mapped) return isPrivateIpv4(mapped);
+  const version = isIP(normalized);
+  if (version === 4) return isPrivateIpv4(normalized);
+  if (version !== 6) return true;
+  if (normalized === '::' || normalized === '::1') return true;
+  const first = Number.parseInt(normalized.split(':')[0] || '0', 16);
+  return (
+    (first & 0xfe00) === 0xfc00 || // fc00::/7 unique local
+    (first & 0xffc0) === 0xfe80 || // fe80::/10 link local
+    normalized.startsWith('2001:db8:')
+  );
+}
+
+function vetDownloadUrl(rawUrl) {
+  const text = String(rawUrl || '').trim();
+  if (text.length > 2048) return { ok: false, reason: '下载 URL 过长' };
+  let u;
+  try { u = new URL(text); } catch { return { ok: false, reason: `下载 URL 格式不正确：${text}` }; }
+  if (!['http:', 'https:'].includes(u.protocol)) return { ok: false, reason: '下载命令仅允许 http/https URL' };
+  if (u.username || u.password) return { ok: false, reason: '下载 URL 不允许携带用户名或密码' };
+  const host = String(u.hostname || '').toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+  if (!host) return { ok: false, reason: '下载 URL 缺少主机名' };
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) {
+    return { ok: false, reason: '下载命令不允许访问本地或内网主机名' };
+  }
+  if (isIP(host) && isPrivateIp(host)) {
+    return { ok: false, reason: '下载命令不允许访问内网、本地或云元数据地址' };
+  }
+  if (!isIP(host) && !host.includes('.')) {
+    return { ok: false, reason: '下载命令不允许访问单标签主机名，避免内网探测' };
+  }
+  return { ok: true };
+}
+
+function isSafeDownloadOutputName(value) {
+  const name = String(value || '');
+  return DOWNLOAD_OUTPUT_RE.test(name) && name === basename(name) && !SENSITIVE_ARG_RE.test(name);
+}
+
+function vetDownloadNumber(raw, { min = 0, max = 30, label = '参数值' } = {}) {
+  if (!/^\d{1,3}$/.test(String(raw || ''))) return { ok: false, reason: `${label} 必须是整数` };
+  const value = Number(raw);
+  if (value < min || value > max) return { ok: false, reason: `${label} 超出允许范围` };
+  return { ok: true };
+}
+
+function pushDownloadUrl(urls, raw) {
+  const vetted = vetDownloadUrl(raw);
+  if (!vetted.ok) return vetted;
+  urls.push(String(raw));
+  if (urls.length > 3) return { ok: false, reason: '下载命令单次最多允许 3 个 URL' };
+  return { ok: true };
+}
+
+function reviewCurlDownload(args) {
+  const urls = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (CURL_BOOLEAN_FLAGS.has(arg) || /^-[fLOJsS]+$/.test(arg)) continue;
+    if (CURL_VALUE_FLAGS.has(arg)) {
+      const output = args[i + 1] || '';
+      if (!isSafeDownloadOutputName(output)) return { ok: false, reason: `curl 输出文件名不安全：${output || '(空)'}` };
+      i += 1;
+      continue;
+    }
+    const outputPrefix = ['--output='].find((prefix) => arg.startsWith(prefix));
+    if (outputPrefix) {
+      const output = arg.slice(outputPrefix.length);
+      if (!isSafeDownloadOutputName(output)) return { ok: false, reason: `curl 输出文件名不安全：${output || '(空)'}` };
+      continue;
+    }
+    const numericPrefix = [...CURL_NUMBER_FLAGS].find((flag) => arg.startsWith(`${flag}=`));
+    if (numericPrefix) {
+      const checked = vetDownloadNumber(arg.slice(numericPrefix.length + 1), { max: numericPrefix === '--retry' ? 3 : 30, label: numericPrefix });
+      if (!checked.ok) return checked;
+      continue;
+    }
+    if (CURL_NUMBER_FLAGS.has(arg)) {
+      const value = args[i + 1] || '';
+      const checked = vetDownloadNumber(value, { max: arg === '--retry' ? 3 : 30, label: arg });
+      if (!checked.ok) return checked;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('-')) return { ok: false, reason: `curl 参数不在下载 allowlist 内：${arg}` };
+    const pushed = pushDownloadUrl(urls, arg);
+    if (!pushed.ok) return pushed;
+  }
+  if (urls.length === 0) return { ok: false, reason: 'curl 下载缺少 URL' };
+  return { ok: true };
+}
+
+function reviewWgetDownload(args) {
+  const urls = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (WGET_BOOLEAN_FLAGS.has(arg)) continue;
+    if (WGET_VALUE_FLAGS.has(arg)) {
+      const output = args[i + 1] || '';
+      if (!isSafeDownloadOutputName(output)) return { ok: false, reason: `wget 输出文件名不安全：${output || '(空)'}` };
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('-O') && arg.length > 2) {
+      const output = arg.slice(2);
+      if (!isSafeDownloadOutputName(output)) return { ok: false, reason: `wget 输出文件名不安全：${output || '(空)'}` };
+      continue;
+    }
+    const outputPrefix = ['--output-document='].find((prefix) => arg.startsWith(prefix));
+    if (outputPrefix) {
+      const output = arg.slice(outputPrefix.length);
+      if (!isSafeDownloadOutputName(output)) return { ok: false, reason: `wget 输出文件名不安全：${output || '(空)'}` };
+      continue;
+    }
+    const numericPrefix = [...WGET_NUMBER_FLAGS].find((flag) => arg.startsWith(`${flag}=`));
+    if (numericPrefix) {
+      const checked = vetDownloadNumber(arg.slice(numericPrefix.length + 1), { min: 1, max: numericPrefix === '--tries' ? 3 : 30, label: numericPrefix });
+      if (!checked.ok) return checked;
+      continue;
+    }
+    if (WGET_NUMBER_FLAGS.has(arg)) {
+      const value = args[i + 1] || '';
+      const checked = vetDownloadNumber(value, { min: 1, max: arg === '--tries' ? 3 : 30, label: arg });
+      if (!checked.ok) return checked;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('-')) return { ok: false, reason: `wget 参数不在下载 allowlist 内：${arg}` };
+    const pushed = pushDownloadUrl(urls, arg);
+    if (!pushed.ok) return pushed;
+  }
+  if (urls.length === 0) return { ok: false, reason: 'wget 下载缺少 URL' };
+  return { ok: true };
+}
+
 function reviewGit(args) {
   if (args.some((arg) => arg === '-C' || arg.startsWith('--git-dir') || arg.startsWith('--work-tree'))) {
     return { ok: false, reason: 'git 不允许切换仓库路径或指定 git-dir/work-tree' };
@@ -181,6 +371,21 @@ function reviewAptDownload(args) {
   };
 }
 
+function reviewUrlDownload(command, args) {
+  if (!shellDockerEnabled()) {
+    return { ok: false, reason: `${command} 下载仅允许在 Docker runner 中执行；本机 runner 不开放联网下载` };
+  }
+  const reviewed = command === 'curl' ? reviewCurlDownload(args) : reviewWgetDownload(args);
+  if (!reviewed.ok) return reviewed;
+  return {
+    ok: true,
+    effect: 'read',
+    risk: 'medium',
+    reason: `Docker 内 ${command} 受限下载，仅允许公开 http/https URL，输出限制在容器 /tmp`,
+    docker: { network: 'bridge', mountWorkspace: false, workdir: '/tmp' },
+  };
+}
+
 function reviewPython(args) {
   if (!shellDockerEnabled()) {
     return { ok: false, reason: 'Python 仅允许在 Docker runner 中执行；本机 runner 不开放 Python' };
@@ -203,6 +408,7 @@ function reviewPython(args) {
 
 function reviewCommandProfile(command, args) {
   if (APT_DOWNLOAD_COMMANDS.has(command)) return reviewAptDownload(args);
+  if (URL_DOWNLOAD_COMMANDS.has(command)) return reviewUrlDownload(command, args);
   if (PYTHON_COMMANDS.has(command)) return reviewPython(args);
   if (FORBIDDEN_COMMANDS.has(command)) return { ok: false, reason: `${command} 属于禁用命令` };
   if (command === 'npm') return reviewNpm(args);
@@ -664,8 +870,10 @@ export async function executeApprovedShellAction(shell = {}) {
 }
 
 export function shellApprovalPreview(review) {
+  const dockerNetwork = review.docker?.network || 'none';
+  const workspace = review.docker?.mountWorkspace === false ? 'none' : dockerWorkspaceMode();
   const runner = shellDockerEnabled()
-    ? `Docker：${dockerImage()}（network=none，workspace=${dockerWorkspaceMode()}，rootfs=read-only）`
+    ? `Docker：${dockerImage()}（network=${dockerNetwork}，workspace=${workspace}，rootfs=read-only）`
     : '本机受限进程';
   return [
     'Shell 命令已通过审核，但需要主人二次确认后才会执行。',
