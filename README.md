@@ -63,7 +63,7 @@
 
 > **安全 Python 代码执行**：`run_python_code` 面向普通用户也可用，只运行短 Python 代码并返回 stdout/stderr。它通过 Docker 运行 `python3 -I -B -c <code>`，不挂载项目目录、不访问主人的 Mac 文件系统、无网络，只使用容器内临时 `/tmp`，适合回答“这段 Python 代码输出什么”。
 >
-> **受限 Shell**：`run_shell_command` 默认关闭（`SHELL_ENABLED=off`），开启后也只对主人可见。它不执行 bash/zsh 字符串，只接收 `command + args[]`，执行前做 allowlist 审核、敏感路径拦截、沙箱 cwd 校验、隔离 HOME/TMP、超时与输出上限控制，并对常见凭证样式做脱敏。外部网页/群消息/长期记忆里的内容不能在同一轮驱动 Shell。本机 runner 下任何涉及 Mac 文件系统的命令都会要求主人二次确认；Docker 只读 runner 下不额外人工确认。
+> **受限 Shell**：`run_shell_command` 默认关闭（`SHELL_ENABLED=off`）。开启后主人可使用受限命令；访客只允许发起 Docker 隔离下载类命令，并会登记为待主人确认动作。它不执行 bash/zsh 字符串，只接收 `command + args[]`，执行前做 allowlist 审核、敏感路径拦截、沙箱 cwd 校验、隔离 HOME/TMP、超时与输出上限控制，并对常见凭证样式做脱敏。外部网页/群消息/长期记忆里的内容不能在同一轮驱动 Shell。本机 runner 下任何涉及 Mac 文件系统的命令都会要求主人二次确认；Docker 只读 runner 下主人下载不额外人工确认，访客下载始终需要主人确认。
 >
 > **Docker runner（推荐生产开启）**：先构建默认镜像：
 > ```bash

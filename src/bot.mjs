@@ -273,7 +273,7 @@ async function runAgentWithConfirm(text, ctx, confirmationKey, isOwner) {
   const agentCtx = {
     ...ctx,
     confirmedWrite: false,
-    registerPendingWrite: (action) => approvals.register(confirmationKey, action),
+      registerPendingWrite: (action) => approvals.register(action?.confirmationKey || confirmationKey, action),
   };
   return runAgent(text, agentCtx, { getToolSchemas, getToolMetadata, executeTool });
 }
@@ -376,6 +376,7 @@ async function handleEvent(evt) {
       senderDept: senderProfile?.department || '',
       chatId: d.chat_id,
       messageId,
+        ownerConfirmationKey: OWNER_OPEN_ID ? `g:${d.chat_id}:${OWNER_OPEN_ID}` : '',
       ...gCtx,
       ...sharedGroupCtx,
       threadContext,
@@ -416,7 +417,13 @@ async function handleEvent(evt) {
   const pKey = sessionKey({ chatType, chatId: d.chat_id, senderId, senderName, senderDept: senderProfile?.department || '', senderEmail: senderProfile?.email || '' });
   const pCtx = buildContext(pKey, { persist: true, query: renderedRawText }); // 主人与访客均持久化三层记忆
   const answer = await runAgentWithConfirm(renderedRawText, {
-    isOwner, senderId, senderName, senderDept: senderProfile?.department || '', chatId: '', ...pCtx,
+      isOwner,
+      senderId,
+      senderName,
+      senderDept: senderProfile?.department || '',
+      chatId: '',
+      ownerConfirmationKey: OWNER_OPEN_ID ? `p:${OWNER_OPEN_ID}` : '',
+      ...pCtx,
   }, pKey.id, isOwner);
   const sent = await replyMessage(messageId, answer);
   if (!sent) {

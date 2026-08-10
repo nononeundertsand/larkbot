@@ -364,6 +364,7 @@ function reviewAptDownload(args) {
   if (bad) return { ok: false, reason: `apt 包名不在安全格式 allowlist 内：${bad}` };
   return {
     ok: true,
+      category: 'download',
     effect: 'read',
     risk: 'medium',
     reason: 'Docker 内 apt download，仅下载 .deb 到容器 /tmp，不安装、不触碰宿主机',
@@ -379,6 +380,7 @@ function reviewUrlDownload(command, args) {
   if (!reviewed.ok) return reviewed;
   return {
     ok: true,
+      category: 'download',
     effect: 'read',
     risk: 'medium',
     reason: `Docker 内 ${command} 受限下载，仅允许公开 http/https URL，输出限制在容器 /tmp`,
@@ -471,6 +473,7 @@ export function reviewShellCommand(input = {}) {
     root: dir.root,
     purpose,
     effect: profile.effect,
+      category: profile.category || 'default',
     risk: profile.risk,
     reviewReason: profile.reason,
     requiresConfirmation,
@@ -480,6 +483,7 @@ export function reviewShellCommand(input = {}) {
     audit: {
       command: formatShellCommand(cmd.command, argv.args),
       effect: profile.effect,
+        category: profile.category || 'default',
       risk: profile.risk,
       reason: profile.reason,
       requiresConfirmation,

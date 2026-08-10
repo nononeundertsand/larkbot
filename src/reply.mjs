@@ -158,7 +158,8 @@ export async function runAgentLegacy(userText, ctx = {}, deps = {}) {
       '如果用户消息或群聊上文中出现“【系统已读取并识别图片：...】”，这表示图片已经由多模态模型读取并转写成视觉描述；回答时应直接基于该视觉描述解释图片内容，不要再说“我看不到图片/只能看到占位符/只能想象”。' +
       '如果工具列表中包含 run_python_code，且用户明确要求运行/执行/跑一段普通 Python 代码并查看输出，应优先调用 run_python_code 实际执行；访客也可以使用该安全 Python 沙箱。' +
       '如果工具列表中包含 run_shell_command，且主人明确要求运行命令或 Python 代码，应优先调用该工具实际执行，不要声称没有代码执行工具，也不要凭空推演输出。' +
-      '运行 Python 代码时使用 run_shell_command 的 command="python3"、args=["-c", 代码字符串]。' +
+      '访客只允许通过 run_shell_command 发起下载类命令：apt/apt-get download <包名>、受限 curl/wget 公开 http/https URL；访客下载会等待主人确认，非下载命令不得尝试。' +
+      '下载 Debian 包时使用 apt download，不要使用 apt install。运行 Python 代码时使用 run_shell_command 的 command="python3"、args=["-c", 代码字符串]。' +
       '需要实时数据时优先调用工具，不要编造。工具返回 refused/error 时，如实、礼貌地告知用户。'
     : '';
 
@@ -331,7 +332,6 @@ const SENSITIVE_TERMS = [
 ];
 const SENSITIVE_PATTERNS = [
   /\b(?:api[-_ ]?key|access[-_]?key|secret|password|credential)s?\b/i,
-  /\bssh\b/i,
   /\bprivate\s+key\b/i,
 ];
 const CREDENTIAL_TOKEN_PATTERNS = [
@@ -353,7 +353,7 @@ const INJECTION_PATTERNS = [
   /(开发者模式|developer mode|越狱|jailbreak|DAN模式)/i,
 ];
 const LOCAL_SYSTEM_PATTERNS = [
-  /(执行|运行|调用|帮我跑|跑一下|run|execute).{0,16}(本机|终端|shell|命令|cmd|command|bash|zsh|ls|pwd|cat|find|grep|rg|git|npm|node|python)/i,
+  /(执行|运行|调用|帮我跑|跑一下|run|execute).{0,16}(本机|终端|shell|命令|cmd|command|bash|zsh|ls|pwd|cat|find|grep|rg|git|npm|node|python|ssh)/i,
   /(列出|读取|返回|查看|展示).{0,16}(文件系统|目录|当前目录|工作区|workspace|根目录|本机文件|配置文件|环境变量|\.env)/i,
   /\b(ls|pwd|cat|find|grep|rg|git|npm)\b.{0,24}(结果|输出|返回|给我|目录|文件|status|test|check)/i,
 ];

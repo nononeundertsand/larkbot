@@ -50,9 +50,9 @@ const TOOL_POLICIES = Object.freeze({
   // 元工具能力面过大，只允许主人使用；命令本身再做正向只读分类。
   run_lark_cli: { ownerOnly: true, dataClass: 'private', outputTrust: 'private' },
 
-  // Shell 能力比普通工具危险：仅主人可见，输出按私密数据处理，且不能由网页/群消息等不可信结果驱动。
+  // Shell 能力比普通工具危险：主人可直接使用受限命令；访客只允许发起 Docker 隔离下载，
+  // 并在工具层转为主人确认。输出默认按私密数据处理，下载类调用会在 getToolMetadata 中降为 external。
   run_shell_command: {
-    ownerOnly: true,
     dataClass: 'private',
     outputTrust: 'private',
     requiresCleanContext: true,

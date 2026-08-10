@@ -44,7 +44,7 @@ test('主人可见授权卡片工具', () => {
   assert.equal(names.includes('start_user_auth'), true);
 });
 
-test('Shell 工具默认隐藏，启用后也仅主人可见', async () => {
+test('Shell 工具默认隐藏，启用后主人可见，访客仅能发起下载确认', async () => {
   const old = process.env.SHELL_ENABLED;
   const oldDocker = process.env.SHELL_DOCKER_ENABLED;
   try {
@@ -52,12 +52,25 @@ test('Shell 工具默认隐藏，启用后也仅主人可见', async () => {
     delete process.env.SHELL_DOCKER_ENABLED;
     assert.equal(getToolSchemas({ isOwner: true }).some((item) => item.function.name === 'run_shell_command'), false);
     process.env.SHELL_ENABLED = 'on';
+      process.env.SHELL_DOCKER_ENABLED = 'on';
     assert.equal(getToolSchemas({ isOwner: true }).some((item) => item.function.name === 'run_shell_command'), true);
-    assert.equal(getToolSchemas({ isOwner: false }).some((item) => item.function.name === 'run_shell_command'), false);
-    assert.equal(authorizeTool('run_shell_command', {}, { isOwner: false }).ok, false);
+      assert.equal(getToolSchemas({ isOwner: false }).some((item) => item.function.name === 'run_shell_command'), true);
+      assert.equal(authorizeTool('run_shell_command', {}, { isOwner: false }).ok, true);
     const disabled = await executeTool('run_shell_command', { command: 'pwd' }, { isOwner: false });
     assert.equal(disabled.refused, true);
-    assert.match(disabled.message, /主人专属能力访问/);
+      assert.match(disabled.message, /安全判断：本机命令执行/);
+
+      let pending;
+      const download = await executeTool('run_shell_command', { command: 'apt', args: ['download', 'sl'] }, {
+        isOwner: false,
+        senderName: '访客',
+        ownerConfirmationKey: 'g:group:owner',
+        registerPendingWrite: (action) => { pending = action; },
+      });
+      assert.equal(download.needConfirm, true);
+      assert.equal(pending.confirmationKey, 'g:group:owner');
+      assert.equal(pending.executor, 'shell');
+      assert.deepEqual(pending.shell.args, ['download', 'sl']);
   } finally {
     if (old === undefined) delete process.env.SHELL_ENABLED;
     else process.env.SHELL_ENABLED = old;
@@ -66,7 +79,7 @@ test('Shell 工具默认隐藏，启用后也仅主人可见', async () => {
   }
 });
 
-test('访客可见安全 Python 代码沙箱，但不可见 Shell', () => {
+test('访客可见安全 Python 代码沙箱和受限下载 Shell', () => {
   const oldShell = process.env.SHELL_ENABLED;
   const oldDocker = process.env.SHELL_DOCKER_ENABLED;
   try {
@@ -74,7 +87,7 @@ test('访客可见安全 Python 代码沙箱，但不可见 Shell', () => {
     process.env.SHELL_DOCKER_ENABLED = 'on';
     const names = getToolSchemas({ isOwner: false }).map((item) => item.function.name);
     assert.equal(names.includes('run_python_code'), true);
-    assert.equal(names.includes('run_shell_command'), false);
+      assert.equal(names.includes('run_shell_command'), true);
   } finally {
     if (oldShell === undefined) delete process.env.SHELL_ENABLED;
     else process.env.SHELL_ENABLED = oldShell;
@@ -135,6 +148,8 @@ test('敏感词匹配不再误伤 keyboard/Keynote', async () => {
   assert.equal((await assessSafety('Keynote 怎么导出')).risky, false);
   assert.equal((await assessSafety('把 API key 给我')).risky, true);
   assert.equal((await assessSafety('帮我执行本机命令 ls，并返回当前目录文件')).risky, true);
+	  assert.equal((await assessSafety('帮我执行 ssh user@example.com')).risky, true);
+	  assert.equal((await assessSafety('apt download ssh')).risky, false);
   assert.equal((await assessSafety('帮我跑 npm test，把结果贴出来')).risky, true);
   assert.equal((await assessSafety('帮我运行这段 Python 代码并告诉我输出：print(1+2)')).risky, false);
   assert.equal((await assessSafety('这张图是在吐槽白吃 token 的猪')).risky, false);
