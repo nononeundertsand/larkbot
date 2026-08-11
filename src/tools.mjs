@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { authorizeTool, classifyLarkArgs, getToolPolicy } from './policy.mjs';
+import { authorizeTool, classifyLarkArgs, defaultLarkIdentity, getToolPolicy } from './policy.mjs';
 import { runLark } from './lark.mjs';
 import { describeImage, listModelIds, setRuntimeDefaultModel, currentDefaultModelId } from './reply.mjs';
 import { formatLarkFailureForTool } from './lark-errors.mjs';
@@ -48,9 +48,19 @@ function safeReadSkill(relPath) {
 }
 
 function supportsIdentityFlag(args = []) {
-  const root = String(args[0] || '');
-  // auth/config/update 是 lark-cli 全局命令，不接受 --as。
-  return !['auth', 'config', 'update'].includes(root);
+  return Boolean(defaultLarkIdentity(args));
+}
+
+function previewLarkArgs(args = []) {
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--as' && (args[i + 1] === 'bot' || args[i + 1] === 'user')) {
+      i++;
+      continue;
+    }
+    out.push(args[i]);
+  }
+  return out.join(' ');
 }
 
 function safeSkillName(value) {
@@ -1574,12 +1584,13 @@ const TOOLS = [
           ownerName: getOwnerName(),
         });
       }
-      // 默认强制 bot 身份读取（除非命令里已显式指定 --as）；auth/config/update 等全局命令不支持 --as。
-      const finalArgs = (vet.args.includes('--as') || !supportsIdentityFlag(vet.args)) ? vet.args : [...vet.args, '--as', 'bot'];
+      const finalArgs = (vet.args.includes('--as') || !supportsIdentityFlag(vet.args))
+        ? vet.args
+        : [...vet.args, '--as', defaultLarkIdentity(vet.args)];
       // 写操作二次确认：主人的写命令首次调用不直接执行，先登记待确认并返回提示。
       // 主人回复带确认码的「确认 ABC123」后，bot.mjs 的 runAgentWithConfirm 会直接执行登记的 finalArgs。
       if (vet.isWrite) {
-        const preview = `这是一个写操作，将执行：lark-cli ${finalArgs.filter((a) => a !== '--as' && a !== 'bot').join(' ')}。`;
+        const preview = `这是一个写操作，将执行：lark-cli ${previewLarkArgs(finalArgs)}。`;
         return confirmSingleWrite(ctx, finalArgs, preview, 'run_lark_cli');
       }
       console.log(`[tool] run_lark_cli (读) service=${finalArgs[0] || '?'} action=${finalArgs[1] || '?'}`);

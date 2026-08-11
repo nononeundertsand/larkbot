@@ -61,6 +61,8 @@ const TOOL_POLICIES = Object.freeze({
 });
 
 // 只读判定采用 allowlist：无法确认只读的命令一律视为写操作并要求确认。
+const WRITE_TOKEN_RE =
+  /(^|[+_-])(add|append|batch_delete|batch_update|clear|complete|copy|create|delete|disable|enable|export|import|insert|merge|move|patch|put|recall|remove|rename|replace|reply|revert|rsvp|send|set|submit|sync|transfer|unmerge|update|upload|write)([+_-]|$)/i;
 const READ_ONLY_TOKEN_RE =
   /(^|[+_-])(get|list|search|fetch|read|mget|agenda|freebusy|triage|messages?|threads?|members?|calendars?|spaces?|nodes?|records?|fields?|views?|tables?|query|status|profile|info|suggestion)([+_-]|$)/i;
 const LOCAL_WRITE_FLAGS = new Set([
@@ -72,7 +74,27 @@ const LOCAL_WRITE_FLAGS = new Set([
   '--confirm',
   '--confirm-send',
 ]);
-const NO_IDENTITY_FLAG_ROOTS = new Set(['auth', 'config', 'update']);
+const NO_IDENTITY_FLAG_ROOTS = new Set(['auth', 'config', 'schema', 'skills', 'update', 'whoami']);
+const USER_IDENTITY_ROOTS = new Set([
+  'approval',
+  'base',
+  'calendar',
+  'contact',
+  'docs',
+  'drive',
+  'mail',
+  'mindnotes',
+  'minutes',
+  'note',
+  'okr',
+  'sheets',
+  'slides',
+  'task',
+  'vc',
+  'whiteboard',
+  'wiki',
+]);
+const BOT_IDENTITY_ROOTS = new Set(['event', 'im']);
 
 export function getToolPolicy(name) {
   return Object.freeze({ ...DEFAULT_POLICY, ...(TOOL_POLICIES[name] || {}) });
@@ -115,17 +137,26 @@ export function authorizeToolTransition(policy, state = {}) {
   return { ok: true };
 }
 
+export function defaultLarkIdentity(rawArgs = []) {
+  const args = Array.isArray(rawArgs) ? rawArgs.map((a) => String(a)) : [];
+  const root = args[0] || '';
+  if (!root || NO_IDENTITY_FLAG_ROOTS.has(root)) return '';
+  if (BOT_IDENTITY_ROOTS.has(root)) return 'bot';
+  if (USER_IDENTITY_ROOTS.has(root)) return 'user';
+  return 'bot';
+}
+
 export function classifyLarkArgs(rawArgs, { isOwner } = {}) {
   if (!Array.isArray(rawArgs) || rawArgs.length === 0) {
     return { ok: false, reason: '命令参数为空' };
   }
   const args = rawArgs.map((a) => String(a));
-  if (args.some((a) => /[;&|`$><\n]/.test(a))) {
-    return { ok: false, reason: '参数包含非法字符' };
+  if (args.some((a) => a.includes('\0'))) {
+    return { ok: false, reason: '参数包含非法 NUL 字符' };
   }
 
   const asIndex = args.indexOf('--as');
-  const identity = asIndex >= 0 ? String(args[asIndex + 1] || '') : 'bot';
+  const identity = asIndex >= 0 ? String(args[asIndex + 1] || '') : defaultLarkIdentity(args);
   if (NO_IDENTITY_FLAG_ROOTS.has(args[0]) && asIndex >= 0) {
     return { ok: false, reason: `${args[0]} 是 lark-cli 全局命令，不支持 --as；请移除 --as 后重试` };
   }
@@ -137,6 +168,16 @@ export function classifyLarkArgs(rawArgs, { isOwner } = {}) {
   if (args[0] === 'api') {
     const method = (args[1] || '').toUpperCase();
     effect = method === 'GET' ? 'read' : 'write';
+  } else if (args[0] === 'schema') {
+    effect = 'read';
+  } else if (args[0] === 'skills') {
+    effect = ['list', 'read'].includes(args[1] || '') ? 'read' : 'write';
+  } else if (args[0] === 'whoami') {
+    effect = 'read';
+  } else if (args[0] === 'config') {
+    effect = ['show', 'get'].includes(args[1] || '') ? 'read' : 'write';
+  } else if (args[0] === 'auth') {
+    effect = ['status', 'whoami'].includes(args[1] || '') ? 'read' : 'write';
   } else if (args.includes('--dry-run')) {
     effect = 'read';
   } else if (args.some((arg) => LOCAL_WRITE_FLAGS.has(arg))) {
@@ -148,7 +189,8 @@ export function classifyLarkArgs(rawArgs, { isOwner } = {}) {
       commandPath.push(arg);
     }
     const action = commandPath.at(-1) || '';
-    if (READ_ONLY_TOKEN_RE.test(action)) effect = 'read';
+    if (WRITE_TOKEN_RE.test(action)) effect = 'write';
+    else if (READ_ONLY_TOKEN_RE.test(action)) effect = 'read';
   }
 
   return { ok: true, args, identity, effect, isWrite: effect === 'write' };

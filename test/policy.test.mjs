@@ -1,14 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { authorizeTool, classifyLarkArgs } from '../src/policy.mjs';
+import { authorizeTool, classifyLarkArgs, defaultLarkIdentity } from '../src/policy.mjs';
 import { executeTool, getToolSchemas, __testing } from '../src/tools.mjs';
 import { assessSafety } from '../src/reply.mjs';
 
 test('未知或明确写命令采用保守写分类', () => {
   assert.equal(classifyLarkArgs(['task', '+complete', '--task-id', 't_x'], { isOwner: true }).isWrite, true);
   assert.equal(classifyLarkArgs(['calendar', '+rsvp', '--event-id', 'e_x'], { isOwner: true }).isWrite, true);
+  assert.equal(classifyLarkArgs(['calendar', 'events', 'delete', '--event-id', 'e_x'], { isOwner: true }).isWrite, true);
+  assert.equal(classifyLarkArgs(['im', '+messages-send', '--user-id', 'ou_x', '--text', 'hi'], { isOwner: true }).isWrite, true);
+  assert.equal(classifyLarkArgs(['docs', '+update', '--doc', 'd', '--command', 'append'], { isOwner: true }).isWrite, true);
   assert.equal(classifyLarkArgs(['calendar', '+agenda'], { isOwner: true }).isWrite, false);
+  assert.equal(classifyLarkArgs(['schema', 'calendar.events.delete'], { isOwner: true }).isWrite, false);
+  assert.equal(classifyLarkArgs(['skills', 'read', 'lark-doc'], { isOwner: true }).isWrite, false);
   assert.equal(classifyLarkArgs(['api', 'POST', '/x'], { isOwner: true }).isWrite, true);
 });
 
@@ -18,6 +23,19 @@ test('本地写入类 lark-cli 参数不会被误判为只读', () => {
   assert.equal(classifyLarkArgs(['sheets', '+export', '--spreadsheet-token', 's'], { isOwner: true }).isWrite, true);
   assert.equal(classifyLarkArgs(['docs', '+fetch', '--doc', 'd'], { isOwner: true }).isWrite, false);
   assert.equal(classifyLarkArgs(['docs', '+fetch', '--doc', 'd', '--output', '/tmp/x'], { isOwner: true }).isWrite, true);
+});
+
+test('长尾 lark-cli 域默认使用正确身份', () => {
+  assert.equal(defaultLarkIdentity(['docs', '+create']), 'user');
+  assert.equal(defaultLarkIdentity(['drive', '+search']), 'user');
+  assert.equal(defaultLarkIdentity(['wiki', '+node-create']), 'user');
+  assert.equal(defaultLarkIdentity(['sheets', '+workbook-create']), 'user');
+  assert.equal(defaultLarkIdentity(['base', '+base-create']), 'user');
+  assert.equal(defaultLarkIdentity(['contact', '+search-user']), 'user');
+  assert.equal(defaultLarkIdentity(['im', '+messages-send']), 'bot');
+  assert.equal(defaultLarkIdentity(['event', 'consume']), 'bot');
+  assert.equal(defaultLarkIdentity(['schema', 'calendar.events.delete']), '');
+  assert.equal(defaultLarkIdentity(['skills', 'read', 'lark-doc']), '');
 });
 
 test('访客看不到且不能执行主人专属工具和元工具', async () => {
@@ -72,6 +90,52 @@ test('calendar_delete 固定使用 user 身份并进入二次确认', async () =
     'user',
   ]);
   assert.match(result.message, /确认码：/);
+});
+
+test('run_lark_cli 创建文档允许 XML 内容并默认使用 user 身份', async () => {
+  let pending;
+  const result = await executeTool('run_lark_cli', {
+    args: ['docs', '+create', '--title', 'Smoke', '--content', '<p>x</p>'],
+  }, {
+    isOwner: true,
+    registerPendingWrite: (action) => { pending = action; },
+  });
+
+  assert.equal(result.needConfirm, true);
+  assert.equal(pending.toolName, 'run_lark_cli');
+  assert.deepEqual(pending.args, [
+    'docs',
+    '+create',
+    '--title',
+    'Smoke',
+    '--content',
+    '<p>x</p>',
+    '--as',
+    'user',
+  ]);
+  assert.doesNotMatch(result.message, / --as user/);
+});
+
+test('run_lark_cli 发送消息按写操作登记确认', async () => {
+  let pending;
+  const result = await executeTool('run_lark_cli', {
+    args: ['im', '+messages-send', '--user-id', 'ou_x', '--text', 'hi'],
+  }, {
+    isOwner: true,
+    registerPendingWrite: (action) => { pending = action; },
+  });
+
+  assert.equal(result.needConfirm, true);
+  assert.deepEqual(pending.args, [
+    'im',
+    '+messages-send',
+    '--user-id',
+    'ou_x',
+    '--text',
+    'hi',
+    '--as',
+    'bot',
+  ]);
 });
 
 test('Shell 工具默认隐藏，启用后主人可见，访客仅能发起下载确认', async () => {
@@ -167,6 +231,8 @@ test('图片消息 key 支持占位符和 JSON content 提取', () => {
 test('auth/config/update 全局命令不追加身份参数', () => {
   assert.equal(__testing.supportsIdentityFlag(['auth', 'login', '--scope', 'calendar:calendar.event:read']), false);
   assert.equal(__testing.supportsIdentityFlag(['config', 'show']), false);
+  assert.equal(__testing.supportsIdentityFlag(['schema', 'calendar.events.delete']), false);
+  assert.equal(__testing.supportsIdentityFlag(['skills', 'read', 'lark-doc']), false);
   assert.equal(__testing.supportsIdentityFlag(['calendar', '+agenda']), true);
   assert.equal(classifyLarkArgs(['auth', 'login', '--as', 'bot'], { isOwner: true }).ok, false);
 });

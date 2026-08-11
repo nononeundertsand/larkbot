@@ -74,7 +74,7 @@
 **元工具**（长尾兜底，仅主人可用）：
 - `list_lark_skills`：读路由表，判断该用哪个飞书域
 - `read_lark_skill`：读某域的用法文档（SKILL.md / references）
-- `run_lark_cli`：执行 AI 拼出的 lark-cli 命令；只读采用 allowlist，未知命令按写操作二次确认
+- `run_lark_cli`：执行 AI 拼出的 lark-cli 命令；只读采用 allowlist，未知命令按写操作二次确认；会按业务域补默认身份（docs/drive/wiki/sheets/base/slides/calendar/task/mail 等默认 `--as user`，im/event 默认 `--as bot`）
 
 于是「建文档 / 知识库 / 多维表格 / 会议纪要…」等其余域的能力可通过 `lark-cli skills` 的内置最新版文档自动探索，无需逐个开发。一旦 `lark-cli skills` 不可用，才回退到 `.local/skills/feishu-skill/` 或 `.env` 的 `FEISHU_SKILL_ROOT=/path/to/feishu-skill`。
 
