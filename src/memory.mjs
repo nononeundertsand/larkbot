@@ -21,8 +21,8 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
-import { updateSummary, extractKeyMemory, updateGroupSummary, extractGroupKeyMemory } from './reply.mjs';
+import { createHash, randomUUID } from 'node:crypto';
+import { updateSummary, extractKeyMemory, updateGroupSummary, extractGroupKeyMemory, currentDefaultModelId } from './reply.mjs';
 
 const SHORT_TURNS = Number(process.env.MEMORY_SHORT_TURNS || 30); // 短期滑动窗口轮数
 const TTL_MS = Number(process.env.MEMORY_TTL_MS || 30 * 60 * 1000); // 短期无活动过期
@@ -98,7 +98,41 @@ function defaultExpiresAt(type, base = Date.now()) {
 function memoryContent(item) {
   return String(item?.content || item?.value || '').trim();
 }
-function factsToMemoryItems(facts, { scope = 'session', source = 'llm' } = {}) {
+function sourceTextHash(value) {
+  return createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value || '')).digest('hex');
+}
+function makeProvenance({ sourceSessionId = '', snapshot = [], evidence = '' } = {}) {
+  const text = evidence || (snapshot || []).map((m) => `${m.role || ''}:${m.content || ''}`).join('\n');
+  return {
+    sourceSessionId,
+    sourceMessageIds: (snapshot || []).map((m) => m.messageId || m.id || '').filter(Boolean),
+    sourceTextHash: text ? sourceTextHash(text) : '',
+    extractedAt: nowIso(),
+    extractorModel: currentDefaultModelId(),
+    evidence: String(evidence || '').slice(0, 500),
+  };
+}
+function hasSecurityContext(key) {
+  return /安全|攻击|注入|越权|风险|防护|红队|拦截/.test(String(key || ''));
+}
+function memoryWritePolicy(key, content, { source = 'llm' } = {}) {
+  if (source !== 'llm') return { status: 'active', policyReason: '' };
+  const text = `${key || ''} ${content || ''}`;
+  if (/(authorization\s*:\s*bearer|api[-_ ]?key|access[-_]?key|refresh[-_]?token|bearer[-_ ]?token|password|credential|private\s+key|\.env|密钥|密码|凭证|私钥|令牌)/i.test(text)) {
+    return { status: 'quarantined', policyReason: '疑似凭证或敏感配置，不进入主动召回' };
+  }
+  if (/(我是|我才是|把我|记住我|以后我).{0,12}(主人|owner|管理员|root)/i.test(text)) {
+    return { status: 'quarantined', policyReason: '疑似身份/权限篡改记忆' };
+  }
+  if (!hasSecurityContext(key) && /(忽略(上面|之前|以上|前面).{0,8}(指令|规则|提示|设定)|system prompt|系统提示词|developer mode|jailbreak|越狱|DAN模式)/i.test(text)) {
+    return { status: 'quarantined', policyReason: '疑似提示词注入内容' };
+  }
+  return { status: 'active', policyReason: '' };
+}
+function memoryIsActive(item) {
+  return (item?.status || 'active') === 'active';
+}
+function factsToMemoryItems(facts, { scope = 'session', source = 'llm', provenance = {} } = {}) {
   if (!facts || typeof facts !== 'object' || Array.isArray(facts)) return [];
   const createdAt = nowIso();
   return Object.entries(facts)
@@ -106,6 +140,7 @@ function factsToMemoryItems(facts, { scope = 'session', source = 'llm' } = {}) {
     .map(([key, value]) => {
       const content = factValueToContent(key, value);
       const type = inferMemoryType(key, content);
+      const policy = memoryWritePolicy(key, content, { source });
       return {
         id: randomUUID(),
         scope,
@@ -114,6 +149,14 @@ function factsToMemoryItems(facts, { scope = 'session', source = 'llm' } = {}) {
         key: String(key),
         content,
         confidence: source === 'legacy' ? 0.65 : 0.75,
+        status: policy.status,
+        policyReason: policy.policyReason,
+        sourceSessionId: provenance.sourceSessionId || '',
+        sourceMessageIds: provenance.sourceMessageIds || [],
+        sourceTextHash: provenance.sourceTextHash || '',
+        extractedAt: provenance.extractedAt || (source === 'llm' ? createdAt : ''),
+        extractorModel: provenance.extractorModel || '',
+        evidence: provenance.evidence || '',
         createdAt,
         updatedAt: createdAt,
         expiresAt: defaultExpiresAt(type),
@@ -138,6 +181,14 @@ function normalizeMemoryItems(rawItems, legacyFacts, { scope = 'session' } = {})
       key,
       content,
       confidence: Number.isFinite(Number(item.confidence)) ? Math.max(0, Math.min(1, Number(item.confidence))) : 0.7,
+      status: item.status || 'active',
+      policyReason: item.policyReason || '',
+      sourceSessionId: item.sourceSessionId || '',
+      sourceMessageIds: Array.isArray(item.sourceMessageIds) ? item.sourceMessageIds : [],
+      sourceTextHash: item.sourceTextHash || '',
+      extractedAt: item.extractedAt || '',
+      extractorModel: item.extractorModel || '',
+      evidence: item.evidence || '',
       createdAt: item.createdAt || item.updatedAt || now,
       updatedAt: item.updatedAt || item.createdAt || now,
       expiresAt: item.expiresAt === undefined ? defaultExpiresAt(type) : item.expiresAt,
@@ -159,6 +210,9 @@ function mergeMemories(existing, incoming) {
       : `${item.scope || ''}|${type}|${content.toLowerCase()}`;
     const prev = byKey.get(mergeKey);
     if (prev && item.source === 'legacy' && prev.source !== 'legacy') {
+      continue;
+    }
+    if (prev && memoryIsActive(prev) && !memoryIsActive(item)) {
       continue;
     }
     if (!prev || prev.source === 'legacy' || timeMs(item.updatedAt) >= timeMs(prev.updatedAt)) {
@@ -201,6 +255,7 @@ function relevanceScore(item, overlap, fallbackRank) {
 function selectRelevantMemories(items, query, { limit = MEMORY_RELEVANT_LIMIT, budgetChars = 2400 } = {}) {
   const queryTokens = tokenize(query);
   const scored = pruneMemories(items)
+    .filter(memoryIsActive)
     .map((item, idx) => {
       const overlap = memoryOverlap(item, queryTokens);
       return { item, overlap, score: relevanceScore(item, overlap, idx) };
@@ -224,6 +279,7 @@ function selectRelevantMemories(items, query, { limit = MEMORY_RELEVANT_LIMIT, b
 function memoriesToFacts(items) {
   const facts = {};
   for (const item of items || []) {
+    if (!memoryIsActive(item)) continue;
     const key = item.key || `${item.type || 'memory'}_${Object.keys(facts).length + 1}`;
     facts[key] = stripKeyPrefix(memoryContent(item), key);
   }
@@ -258,6 +314,12 @@ function graphEdgeKey(edge) {
     graphEntityKey(edge.object),
   ].join('|');
 }
+function graphEdgeIsActive(edge) {
+  return (edge?.status || 'active') === 'active';
+}
+function isAliasPredicate(predicate) {
+  return /别名|别称|昵称|alias|称呼规则/i.test(String(predicate || ''));
+}
 function rawGraphEdges(raw) {
   if (Array.isArray(raw)) return raw;
   if (!raw || typeof raw !== 'object') return [];
@@ -268,7 +330,7 @@ function rawGraphEdges(raw) {
   if (raw.graph && typeof raw.graph === 'object') return rawGraphEdges(raw.graph);
   return [];
 }
-function normalizeGraphEdges(rawEdges, { scope = 'session', origin = 'llm' } = {}) {
+function normalizeGraphEdges(rawEdges, { scope = 'session', origin = 'llm', provenance = {} } = {}) {
   const now = nowIso();
   const edges = [];
   for (const raw of Array.isArray(rawEdges) ? rawEdges : []) {
@@ -278,6 +340,7 @@ function normalizeGraphEdges(rawEdges, { scope = 'session', origin = 'llm' } = {
     const object = entityLabel(raw.object ?? raw.target ?? raw.to ?? raw.tail);
     if (!subject || !predicate || !object) continue;
     const relationType = inferMemoryType(predicate, `${subject} ${object} ${raw.description || raw.note || ''}`);
+    const policy = memoryWritePolicy(predicate, `${subject} ${object} ${raw.description || raw.note || ''}`, { source: origin });
     edges.push({
       id: raw.id || randomUUID(),
       scope: raw.scope || scope,
@@ -287,6 +350,14 @@ function normalizeGraphEdges(rawEdges, { scope = 'session', origin = 'llm' } = {
       description: String(raw.description || raw.note || '').trim(),
       confidence: clampConfidence(raw.confidence, origin === 'legacy' ? 0.65 : 0.75),
       origin: raw.origin || raw.memorySource || origin,
+      status: raw.status || policy.status,
+      policyReason: raw.policyReason || policy.policyReason,
+      sourceSessionId: raw.sourceSessionId || provenance.sourceSessionId || '',
+      sourceMessageIds: Array.isArray(raw.sourceMessageIds) ? raw.sourceMessageIds : provenance.sourceMessageIds || [],
+      sourceTextHash: raw.sourceTextHash || provenance.sourceTextHash || '',
+      extractedAt: raw.extractedAt || provenance.extractedAt || (origin === 'llm' ? now : ''),
+      extractorModel: raw.extractorModel || provenance.extractorModel || '',
+      evidence: raw.evidence || provenance.evidence || '',
       createdAt: raw.createdAt || raw.updatedAt || now,
       updatedAt: raw.updatedAt || raw.createdAt || now,
       expiresAt: raw.expiresAt === undefined ? defaultExpiresAt(relationType) : raw.expiresAt,
@@ -303,6 +374,7 @@ function mergeGraphEdges(existing, incoming) {
     const key = graphEdgeKey(edge);
     const prev = byKey.get(key);
     if (prev && edge.origin === 'legacy' && prev.origin !== 'legacy') continue;
+    if (prev && graphEdgeIsActive(prev) && !graphEdgeIsActive(edge)) continue;
     if (!prev || prev.origin === 'legacy' || timeMs(edge.updatedAt) >= timeMs(prev.updatedAt)) {
       byKey.set(key, {
         ...prev,
@@ -314,6 +386,28 @@ function mergeGraphEdges(existing, incoming) {
     }
   }
   return [...byKey.values()];
+}
+function graphAliasesFromEdges(edges) {
+  const aliases = [];
+  const seen = new Set();
+  for (const edge of edges || []) {
+    if (!graphEdgeIsActive(edge) || !isAliasPredicate(edge.predicate)) continue;
+    const canonical = entityLabel(edge.subject);
+    const alias = entityLabel(edge.object);
+    if (!canonical || !alias || graphEntityKey(canonical) === graphEntityKey(alias)) continue;
+    const key = `${edge.scope || ''}|${graphEntityKey(canonical)}|${graphEntityKey(alias)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    aliases.push({
+      scope: edge.scope || 'session',
+      canonical,
+      alias,
+      confidence: Number(edge.confidence) || 0.7,
+      sourceEdgeId: edge.id || '',
+      updatedAt: edge.updatedAt || '',
+    });
+  }
+  return aliases;
 }
 function pruneGraphEdges(edges) {
   const now = Date.now();
@@ -362,7 +456,7 @@ function graphNodesFromEdges(edges) {
 }
 function graphToPersist(graph) {
   const edges = pruneGraphEdges(graph?.edges || []);
-  return { nodes: graphNodesFromEdges(edges), edges };
+  return { nodes: graphNodesFromEdges(edges), aliases: graphAliasesFromEdges(edges), edges };
 }
 function graphForPrompt(graph) {
   const edges = pruneGraphEdges(graph?.edges || [])
@@ -376,7 +470,7 @@ function graphForPrompt(graph) {
     }));
   return { edges };
 }
-function splitExtractedKnowledge(raw, { scope = 'session' } = {}) {
+function splitExtractedKnowledge(raw, { scope = 'session', provenance = {} } = {}) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { facts: {}, edges: [] };
   const graphKeys = new Set(['relations', 'edges', 'graph', 'graphEdges', 'graph_edges', 'nodes']);
   const facts = raw.facts && typeof raw.facts === 'object' && !Array.isArray(raw.facts)
@@ -390,8 +484,21 @@ function splitExtractedKnowledge(raw, { scope = 'session' } = {}) {
   }
   return {
     facts,
-    edges: normalizeGraphEdges(rawGraphEdges(raw), { scope, origin: 'llm' }),
+    edges: normalizeGraphEdges(rawGraphEdges(raw), { scope, origin: 'llm', provenance }),
   };
+}
+function expandGraphQueryWithAliases(query, edges) {
+  const expanded = [String(query || '')];
+  const rawQuery = String(query || '');
+  for (const edge of edges || []) {
+    if (!graphEdgeIsActive(edge) || !isAliasPredicate(edge.predicate)) continue;
+    const subject = entityLabel(edge.subject);
+    const object = entityLabel(edge.object);
+    if (!subject || !object) continue;
+    if (rawQuery.includes(subject)) expanded.push(object);
+    if (rawQuery.includes(object)) expanded.push(subject);
+  }
+  return expanded.join(' ');
 }
 function graphOverlap(edge, queryTokens) {
   const textTokens = tokenize(graphEdgeText(edge));
@@ -403,8 +510,9 @@ function graphEndpointKeys(edge) {
   return [graphEntityKey(edge.subject), graphEntityKey(edge.object)].filter(Boolean);
 }
 function selectRelevantGraphEdges(edges, query, { limit = MEMORY_GRAPH_RELEVANT_LIMIT, budgetChars = 2000, hops = MEMORY_GRAPH_HOPS } = {}) {
-  const queryTokens = tokenize(query);
-  const scored = pruneGraphEdges(edges)
+  const activeEdges = pruneGraphEdges(edges).filter(graphEdgeIsActive);
+  const queryTokens = tokenize(expandGraphQueryWithAliases(query, activeEdges));
+  const scored = activeEdges
     .map((edge, idx) => {
       const overlap = graphOverlap(edge, queryTokens);
       return { edge, overlap, score: relevanceScore(edge, overlap, idx) };
@@ -820,9 +928,10 @@ async function doMaintainMemory(key) {
     s.turnsSinceExtract = 0;
     const snapshot = s.messages.slice();
     const scope = desc.chatType === 'group' ? 'group_user' : 'p2p';
+    const provenance = makeProvenance({ sourceSessionId: desc.id, snapshot });
     const extracted = await extractKeyMemory(s.facts, snapshot, graphForPrompt(s.graph));
-    const { facts, edges } = splitExtractedKnowledge(extracted, { scope });
-    s.memories = mergeMemories(s.memories || [], factsToMemoryItems(facts, { scope, source: 'llm' }));
+    const { facts, edges } = splitExtractedKnowledge(extracted, { scope, provenance });
+    s.memories = mergeMemories(s.memories || [], factsToMemoryItems(facts, { scope, source: 'llm', provenance }));
     s.graph = { edges: mergeGraphEdges(s.graph?.edges || [], edges) };
     changed = true;
   }
@@ -851,9 +960,10 @@ async function doMaintainGroupMemory(chatId) {
     s.turnsSinceExtract = 0;
     const snapshot = s.messages.slice(-Math.min(s.messages.length, SHORT_TURNS * 2));
     s.summary = await updateGroupSummary(s.summary, snapshot);
+    const provenance = makeProvenance({ sourceSessionId: `group:${s.chatId}`, snapshot });
     const extracted = await extractGroupKeyMemory(s.facts, snapshot, graphForPrompt(s.graph));
-    const { facts, edges } = splitExtractedKnowledge(extracted, { scope: 'group' });
-    s.memories = mergeMemories(s.memories || [], factsToMemoryItems(facts, { scope: 'group', source: 'llm' }));
+    const { facts, edges } = splitExtractedKnowledge(extracted, { scope: 'group', provenance });
+    s.memories = mergeMemories(s.memories || [], factsToMemoryItems(facts, { scope: 'group', source: 'llm', provenance }));
     s.graph = { edges: mergeGraphEdges(s.graph?.edges || [], edges) };
     changed = true;
   }

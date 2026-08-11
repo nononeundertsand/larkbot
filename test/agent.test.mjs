@@ -45,6 +45,48 @@ test('同轮多个写调用只执行第一个待确认动作', async () => {
   assert.equal(result, '确认 task_create');
 });
 
+test('Agent trace 记录推理和工具链路，并脱敏敏感信息', async () => {
+  let round = 0;
+  const traces = [];
+  const secret = 'sk-1234567890abcdef123456';
+  const result = await runAgent(`抓取网页 token=${secret}`, baseCtx, {
+    getToolSchemas: schemas,
+    getToolMetadata: (name) => getToolPolicy(name),
+    executeTool: async () => ({
+      content: `Authorization: Bearer ${secret}\napi_key=${secret}`,
+    }),
+    chatLLMRaw: async () => {
+      round++;
+      if (round === 1) {
+        return {
+          role: 'assistant',
+          tool_calls: [{
+            id: 'w',
+            function: { name: 'web_fetch', arguments: `{"url":"https://example.com/?token=${secret}"}` },
+          }],
+        };
+      }
+      return { role: 'assistant', content: '抓取完成' };
+    },
+    traceMode: 'full',
+    traceSink: (trace) => traces.push(trace),
+  });
+
+  assert.equal(result, '抓取完成');
+  assert.equal(traces.length, 1);
+  const trace = traces[0];
+  assert.equal(trace.status, 'ok');
+  assert.equal(trace.model, 'test-model');
+  assert.equal(trace.toolCallCount, 1);
+  assert.ok(trace.steps.some((step) => step.type === 'reason'));
+  assert.ok(trace.steps.some((step) => step.type === 'tool_call' && step.toolName === 'web_fetch'));
+  assert.ok(trace.steps.some((step) => step.type === 'tool_result' && step.toolName === 'web_fetch'));
+  assert.ok(trace.steps.some((step) => step.type === 'respond'));
+  const serialized = JSON.stringify(trace);
+  assert.doesNotMatch(serialized, new RegExp(secret));
+  assert.match(serialized, /REDACTED/);
+});
+
 test('外部不可信数据不能继续驱动私密读取', async () => {
   let llmRound = 0;
   const seenMessages = [];

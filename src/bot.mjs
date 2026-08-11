@@ -28,6 +28,7 @@ import { getToolSchemas, getToolMetadata, executeTool, getRecentChatContext, ren
 import { runLark } from './lark.mjs';
 import { ApprovalStore } from './approval.mjs';
 import { SessionQueue } from './session-queue.mjs';
+import { RuntimeStateStore } from './state-store.mjs';
 import { formatLarkFailureForUser, formatLarkSuccessForUser } from './lark-errors.mjs';
 import { getOwnerName, getOwnerOpenId, initOwnerIdentity, isOwnerSender, maskId } from './owner.mjs';
 import { formatSafetyRefusal } from './safety-response.mjs';
@@ -87,14 +88,28 @@ let BOT_OPEN_ID = process.env.BOT_OPEN_ID || '';
 let BOT_NAME = process.env.BOT_NAME || '';
 
 // 去重：飞书事件可能重复投递，用 message_id 作幂等键
-const seen = new Set();
 const SEEN_MAX = 5000;
-function alreadyHandled(id) {
+const EVENT_STATE_TTL_MS = Number(process.env.EVENT_STATE_TTL_MS || 7 * 24 * 3600 * 1000);
+const stateStore = new RuntimeStateStore({
+  maxProcessedEvents: SEEN_MAX,
+  processedEventTtlMs: EVENT_STATE_TTL_MS,
+});
+const seen = new Set(stateStore.listProcessedEventIds());
+function alreadyHandled(id, meta = {}) {
   if (!id) return false;
   if (seen.has(id)) return true;
+  if (stateStore.rememberProcessedEvent(id, meta)) {
+    seen.add(id);
+    return true;
+  }
   seen.add(id);
   if (seen.size > SEEN_MAX) seen.delete(seen.values().next().value); // 简单容量控制
   return false;
+}
+function forgetHandled(id) {
+  if (!id) return;
+  seen.delete(id);
+  stateStore.forgetProcessedEvent(id);
 }
 
 // 时间闸：只处理「服务启动之后」发生的消息，忽略启动前的历史/积压事件。
@@ -135,7 +150,7 @@ function isRateLimited(senderId) {
 const EVENT_QUEUE_MAX = Number(process.env.EVENT_QUEUE_MAX || 100);
 
 const CONFIRM_TTL_MS = Number(process.env.CONFIRM_TTL_MS || 5 * 60 * 1000); // 5 分钟
-const approvals = new ApprovalStore({ ttlMs: CONFIRM_TTL_MS });
+const approvals = new ApprovalStore({ ttlMs: CONFIRM_TTL_MS, stateStore });
 
 // 访客身份解析：用 open_id 查姓名+部门等（用主人的 user 身份查）。带缓存，避免重复请求。
 // 解析开关：SET RESOLVE_VISITOR=off 可关闭。
@@ -284,7 +299,11 @@ async function handleEvent(evt) {
   const d = evt.data || evt;
   const messageId = d.message_id || d.id;
   if (!messageId) return;
-  if (alreadyHandled(messageId)) return;
+  if (alreadyHandled(messageId, {
+    chatId: d.chat_id || '',
+    senderId: d.sender_id || '',
+    eventTime: getEventTimeMs(evt, d),
+  })) return;
 
   // 时间闸：忽略「服务启动之前」发生的历史/积压消息（飞书离线补推 + 断线重连重放）。
   // 只有能明确判定为「旧」的才拦（取到时间且早于启动时刻-宽限）；取不到时间则放行，避免误杀。
@@ -349,7 +368,7 @@ async function handleEvent(evt) {
       if (risky) {
         console.warn(`[safety] ⚠️ 拒绝访客请求 ${messageId}：${reason}`);
         const sent = await replyMessage(messageId, formatSafetyRefusal({ text: renderedUserText, reason, ownerName: OWNER_NAME }));
-        if (!sent) seen.delete(messageId);
+        if (!sent) forgetHandled(messageId);
         return;
       }
     }
@@ -383,7 +402,7 @@ async function handleEvent(evt) {
     }, gKey.id, isOwner);
     const sent = await replyMessage(messageId, answer);
     if (!sent) {
-      seen.delete(messageId);
+      forgetHandled(messageId);
       return;
     }
     appendTurn(gKey, qText, answer, { persist: true });
@@ -409,7 +428,7 @@ async function handleEvent(evt) {
     if (risky) {
       console.warn(`[safety] ⚠️ 拒绝访客私聊请求 ${messageId}：${reason}`);
       const sent = await replyMessage(messageId, formatSafetyRefusal({ text: renderedRawText, reason, ownerName: OWNER_NAME }));
-      if (!sent) seen.delete(messageId);
+      if (!sent) forgetHandled(messageId);
       return;
     }
   }
@@ -427,7 +446,7 @@ async function handleEvent(evt) {
   }, pKey.id, isOwner);
   const sent = await replyMessage(messageId, answer);
   if (!sent) {
-    seen.delete(messageId);
+    forgetHandled(messageId);
     return;
   }
   appendTurn(pKey, renderedRawText, answer, { persist: true });
@@ -455,7 +474,7 @@ const eventScheduler = new SessionQueue({
   getKey: eventSessionKey,
   onError: (e, evt) => {
     const id = eventMessageId(evt);
-    if (id) seen.delete(id);
+    if (id) forgetHandled(id);
     console.error('[handle] 未捕获异常：', e);
   },
 });

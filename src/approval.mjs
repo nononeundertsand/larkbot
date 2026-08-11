@@ -6,11 +6,16 @@ export class ApprovalStore {
     ttlMs = 5 * 60 * 1000,
     confirmWords = DEFAULT_CONFIRM_WORDS,
     cancelWords = DEFAULT_CANCEL_WORDS,
+    stateStore = null,
   } = {}) {
     this.ttlMs = ttlMs;
     this.confirmWords = new Set(confirmWords.map((x) => x.toLowerCase()));
     this.cancelWords = new Set(cancelWords.map((x) => x.toLowerCase()));
+    this.stateStore = stateStore;
     this.pending = new Map();
+    for (const action of this.stateStore?.loadApprovals?.({ ttlMs }) || []) {
+      if (action?.confirmationKey) this.pending.set(action.confirmationKey, action);
+    }
   }
 
   register(confirmationKey, action) {
@@ -23,18 +28,20 @@ export class ApprovalStore {
     } else if (!Array.isArray(normalized?.args) || normalized.args.length === 0) {
       throw new Error('待确认写操作缺少命令参数');
     }
-    this.pending.set(confirmationKey, {
+    const pending = {
       ...normalized,
       confirmationKey,
       at: Date.now(),
-    });
+    };
+    this.pending.set(confirmationKey, pending);
+    this.stateStore?.saveApproval?.(confirmationKey, pending);
   }
 
   resolve(confirmationKey, text, { isOwner = false } = {}) {
     const action = this.pending.get(confirmationKey);
     if (!action) return { kind: 'none' };
     if (Date.now() - action.at >= this.ttlMs) {
-      this.pending.delete(confirmationKey);
+      this.deletePending(confirmationKey);
       return { kind: 'expired' };
     }
     if (!isOwner) return { kind: 'none' };
@@ -44,28 +51,33 @@ export class ApprovalStore {
     if (confirmToken) {
       const confirmRe = new RegExp(`^(${[...this.confirmWords].map(escapeRe).join('|')})\\s*${escapeRe(confirmToken)}$`, 'i');
       if (confirmRe.test(normalized)) {
-        this.pending.delete(confirmationKey);
+        this.deletePending(confirmationKey);
         return { kind: 'execute', action };
       }
       if ([...this.confirmWords].some((word) => normalized === word || normalized.startsWith(`${word} `))) {
         return { kind: 'mismatch', action };
       }
     } else if (this.confirmWords.has(normalized)) {
-      this.pending.delete(confirmationKey);
+      this.deletePending(confirmationKey);
       return { kind: 'execute', action };
     }
     if (this.cancelWords.has(normalized)) {
-      this.pending.delete(confirmationKey);
+      this.deletePending(confirmationKey);
       return { kind: 'cancel', action };
     }
 
     // 用户转而提出新请求时作废旧审批，避免稍后的简短“ok”误触发。
-    this.pending.delete(confirmationKey);
+    this.deletePending(confirmationKey);
     return { kind: 'superseded', action };
   }
 
   size() {
     return this.pending.size;
+  }
+
+  deletePending(confirmationKey) {
+    this.pending.delete(confirmationKey);
+    this.stateStore?.deleteApproval?.(confirmationKey);
   }
 }
 

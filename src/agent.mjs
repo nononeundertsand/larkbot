@@ -46,6 +46,7 @@ import {
 import { authorizeToolTransition, getToolPolicy } from './policy.mjs';
 import { randomUUID } from 'node:crypto';
 import { formatSafetyRefusal } from './safety-response.mjs';
+import { createAgentTrace, previewForTrace } from './trace.mjs';
 
 const MAX_ITERS = Number(process.env.AGENT_MAX_ITERS || 6);
 const MAX_TOOL_CALLS = Number(process.env.AGENT_MAX_TOOL_CALLS || 10);
@@ -174,10 +175,21 @@ async function actNode(state, assistantMsg, executeTool, getToolMetadata) {
         tool_call_id: tc.id || tc.function?.name,
         content: JSON.stringify({ error: '工具参数不是合法 JSON' }),
       });
+      state.trace.step('tool_result', {
+        status: 'error',
+        toolName: tc.function?.name || '',
+        error: '工具参数不是合法 JSON',
+      });
       continue;
     }
     const name = tc.function?.name;
     if (state.toolCallCount >= MAX_TOOL_CALLS) {
+      state.trace.step('guard', {
+        status: 'blocked',
+        toolName: name,
+        reason: '工具调用次数超过上限',
+        maxToolCalls: MAX_TOOL_CALLS,
+      });
       return { exhausted: true };
     }
     state.toolCallCount += 1;
@@ -190,12 +202,37 @@ async function actNode(state, assistantMsg, executeTool, getToolMetadata) {
         tool_call_id: tc.id || name,
         content: JSON.stringify({ error: '同一工具参数重复调用过多，已停止重试' }),
       });
+      state.trace.step('tool_result', {
+        status: 'error',
+        toolName: name,
+        args,
+        error: '同一工具参数重复调用过多，已停止重试',
+      });
       continue;
     }
 
     const policy = getToolMetadata(name, args);
+    state.trace.step('tool_call', {
+      toolName: name,
+      args,
+      callIndex: state.toolCallCount,
+      policy: {
+        ownerOnly: Boolean(policy.ownerOnly),
+        effect: policy.effect,
+        dataClass: policy.dataClass,
+        outputTrust: policy.outputTrust,
+        silentEgress: Boolean(policy.silentEgress),
+        requiresCleanContext: Boolean(policy.requiresCleanContext),
+      },
+    });
     const transition = authorizeToolTransition(policy, state);
     if (!transition.ok) {
+      state.trace.step('guard', {
+        status: 'blocked',
+        toolName: name,
+        reason: transition.reason,
+        policyDecision: 'deny',
+      });
       return {
         needRefusalMsg: formatSafetyRefusal({
           text: state.userText,
@@ -206,14 +243,28 @@ async function actNode(state, assistantMsg, executeTool, getToolMetadata) {
     }
 
     console.log(`[agent:${state.runId}] tool=${name} call=${state.toolCallCount}/${MAX_TOOL_CALLS}`);
+    const started = Date.now();
     const result = await executeTool(name, args, state.ctx);
+    const durationMs = Date.now() - started;
     const serialized = JSON.stringify(result).slice(0, 6000);
     state.messages.push({
       role: 'tool',
       tool_call_id: tc.id || name,
       content: policy.outputTrust === 'trusted' ? serialized : wrapToolData(serialized),
     });
+    state.trace.step('tool_result', {
+      status: result?.refused ? 'refused' : result?.needConfirm ? 'need_confirm' : result?.error ? 'error' : 'ok',
+      toolName: name,
+      durationMs,
+      result,
+    });
     if (result?.refused) {
+      state.trace.step('guard', {
+        status: 'blocked',
+        toolName: name,
+        reason: result.message || result.reason || '请求被安全策略拒绝',
+        policyDecision: 'tool_refused',
+      });
       return {
         needRefusalMsg: result.securityRefusal
           ? result.message
@@ -225,7 +276,15 @@ async function actNode(state, assistantMsg, executeTool, getToolMetadata) {
       if (policy.dataClass === 'private' && policy.effect === 'read') state.privateDataRead = true;
     }
     // 一轮只允许一个待确认副作用；命中后立即停止，避免预览与实际 pending 动作错位。
-    if (result?.needConfirm) return { needConfirmMsg: result.message };
+    if (result?.needConfirm) {
+      state.trace.step('guard', {
+        status: 'need_confirm',
+        toolName: name,
+        reason: '写操作需要二次确认',
+        policyDecision: 'confirm',
+      });
+      return { needConfirmMsg: result.message };
+    }
   }
   return {};
 }
@@ -239,7 +298,12 @@ async function convergeNode(state, callLLM) {
       '直接基于上面已获得的信息，用简洁自然的中文给用户一个明确的最终答复。' +
       '若已查到数据就如实告知；若某步失败，就说明查到哪一步、失败原因，并给出下一步建议。',
   });
+  const started = Date.now();
   const finalMsg = await callLLM(state.messages, { task: 'reasoning', model: state.model }); // 不带 tools
+  state.trace.step('converge', {
+    durationMs: Date.now() - started,
+    content: finalMsg.content || '',
+  });
   const finalText = (finalMsg.content || '').trim();
   if (finalText) return finalText;
   // 仍为空：诚实兜底，绝不降级到无工具数据的普通问答（会编造）。
@@ -278,17 +342,45 @@ export async function runAgent(userText, ctx = {}, deps = {}) {
     externalTaint: false,
     privateDataRead: false,
   };
+  state.trace = createAgentTrace({
+    mode: deps.traceMode,
+    sink: deps.traceSink,
+    runId: state.runId,
+    ctx,
+    userText: text,
+    model: state.model,
+    toolsCount: tools.length,
+    messages: state.messages,
+  });
 
   try {
     console.log(`[agent:${state.runId}] start owner=${Boolean(ctx.isOwner)} tools=${tools.length}`);
+    state.trace.step('build', {
+      owner: Boolean(ctx.isOwner),
+      toolsCount: tools.length,
+      promptMessageCount: state.messages.length,
+      promptTotalChars: state.messages.reduce((sum, msg) => sum + String(msg.content || '').length, 0),
+      memoryBriefPreview: previewForTrace(ctx.memoryBrief || ''),
+      groupMemoryBriefPreview: previewForTrace(ctx.groupMemoryBrief || ''),
+    });
     // reason ↔ act ↔ guard ↔ observe 循环
     while (true) {
+      const reasonStarted = Date.now();
       const msg = await callLLM(state.messages, { tools, task: 'reasoning', model: state.model }); // reason 节点
+      const reasonDurationMs = Date.now() - reasonStarted;
       const calls = msg.tool_calls || [];
+      state.trace.step('reason', {
+        durationMs: reasonDurationMs,
+        toolCalls: calls.map((tc) => tc.function?.name || ''),
+        content: msg.content || '',
+      });
 
       // 收敛条件：无工具调用 → LLM 已能直接作答
       if (calls.length === 0) {
-        return (msg.content || '').trim() || EMPTY_REPLY; // respond 节点
+        const response = (msg.content || '').trim() || EMPTY_REPLY;
+        state.trace.step('respond', { status: 'ok', content: response });
+        state.trace.finish('ok', { response, toolCallCount: state.toolCallCount });
+        return response; // respond 节点
       }
 
       // act 节点：执行工具并回灌
@@ -296,17 +388,30 @@ export async function runAgent(userText, ctx = {}, deps = {}) {
       const action = await actNode(state, msg, executeTool, getToolMetadata);
 
       // guard 节点：写操作二次确认命中 → 立即短路，确定性把确认提示交给用户
-      if (action.needConfirmMsg) return action.needConfirmMsg;
-      if (action.needRefusalMsg) return action.needRefusalMsg;
+      if (action.needConfirmMsg) {
+        state.trace.step('respond', { status: 'need_confirm', content: action.needConfirmMsg });
+        state.trace.finish('need_confirm', { response: action.needConfirmMsg, toolCallCount: state.toolCallCount });
+        return action.needConfirmMsg;
+      }
+      if (action.needRefusalMsg) {
+        state.trace.step('respond', { status: 'refused', content: action.needRefusalMsg });
+        state.trace.finish('refused', { response: action.needRefusalMsg, toolCallCount: state.toolCallCount });
+        return action.needRefusalMsg;
+      }
       if (action.exhausted) break;
 
       // observe：迭代计数，用尽则收敛
       if (++state.iter >= MAX_ITERS) break;
     }
-    return await convergeNode(state, callLLM); // converge → respond
+    const response = await convergeNode(state, callLLM); // converge → respond
+    state.trace.step('respond', { status: 'converged', content: response });
+    state.trace.finish('converged', { response, toolCallCount: state.toolCallCount });
+    return response;
   } catch (err) {
     // fallback 节点：任何异常（多为 LLM 接口失败）都兜底成字符串，绝不外抛、绝不编造。
     console.error('[agent] 编排失败：', err.message);
+    state.trace.step('error', { error: err.message });
+    state.trace.finish('error', { response: FALLBACK_ERROR, error: err.message, toolCallCount: state.toolCallCount });
     return FALLBACK_ERROR;
   }
 }
