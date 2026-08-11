@@ -44,7 +44,7 @@
 
 | 工具 | 能力 | 身份 | 写操作 |
 |------|------|------|--------|
-| `calendar_agenda` / `calendar_create` | 查看 / 创建日程 | `--as user` | 建=写 |
+| `calendar_agenda` / `calendar_create` / `calendar_delete` | 查看 / 创建 / 删除日程 | `--as user` | 建/删=写 |
 | `task_list` / `task_create` | 查看 / 创建任务 | `--as user` | 建=写 |
 | `send_message` | 代发消息给某人/当前群 | `--as bot` | 写 |
 | `mail_triage` / `mail_send` | 查看 / 发送邮件 | `--as user` | 发=写 |
@@ -83,7 +83,7 @@
 - **任务路由**：识图走多模态模型、安全/意图/记忆抽取走快模型、群聊主推理走强模型（`LLM_ROUTE_*`）。
 - **运行时切换**：主人在飞书里说「换成 gpt-5」即时生效（`switch_model` / `list_models` 工具，仅主人，进程重启回落 `.env`）。
 
-> **提示**：日历/任务/邮件工具走 `--as user`，需主人先给对应 scope 授权（如 `lark-cli auth login --scope "calendar:calendar.event:read"`）。未授权时工具会**如实返回授权错误**并转达给你，绝不编造结果。
+> **提示**：日历/任务/邮件工具走 `--as user`，需主人先给对应 scope 授权（如日程查看/创建/删除分别需要 `calendar:calendar.event:read`、`calendar:calendar.event:create`、`calendar:calendar.event:delete`）。未授权时工具会**如实返回授权错误**并转达给你，绝不编造结果。
 
 ## 安全机制
 

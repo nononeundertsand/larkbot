@@ -44,6 +44,36 @@ test('主人可见授权卡片工具', () => {
   assert.equal(names.includes('start_user_auth'), true);
 });
 
+test('calendar_delete 固定使用 user 身份并进入二次确认', async () => {
+  let pending;
+  const result = await executeTool('calendar_delete', {
+    event_id: 'evt_123',
+    calendar_id: 'primary',
+    summary: '测试日程',
+    need_notification: false,
+  }, {
+    isOwner: true,
+    registerPendingWrite: (action) => { pending = action; },
+  });
+
+  assert.equal(result.needConfirm, true);
+  assert.equal(pending.toolName, 'calendar_delete');
+  assert.deepEqual(pending.args, [
+    'calendar',
+    'events',
+    'delete',
+    '--calendar-id',
+    'primary',
+    '--event-id',
+    'evt_123',
+    '--need-notification',
+    'false',
+    '--as',
+    'user',
+  ]);
+  assert.match(result.message, /确认码：/);
+});
+
 test('Shell 工具默认隐藏，启用后主人可见，访客仅能发起下载确认', async () => {
   const old = process.env.SHELL_ENABLED;
   const oldDocker = process.env.SHELL_DOCKER_ENABLED;

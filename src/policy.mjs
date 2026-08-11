@@ -27,6 +27,7 @@ const TOOL_POLICIES = Object.freeze({
 
   calendar_agenda: { ownerOnly: true, dataClass: 'private', outputTrust: 'private' },
   calendar_create: { ownerOnly: true, effect: 'write', dataClass: 'private' },
+  calendar_delete: { ownerOnly: true, effect: 'write', dataClass: 'private' },
   task_list: { ownerOnly: true, dataClass: 'private', outputTrust: 'private' },
   task_create: { ownerOnly: true, effect: 'write', dataClass: 'private' },
   send_message: { ownerOnly: true, effect: 'write', dataClass: 'private' },

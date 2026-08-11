@@ -1026,6 +1026,35 @@ const TOOLS = [
     },
   },
 
+  {
+    name: 'calendar_delete',
+    description:
+      '删除主人已有日程（写操作，需主人二次确认）。' +
+      '必须先通过 calendar_agenda 或日程搜索确认 event_id；不确定目标时先询问用户，不要猜测删除。',
+    parameters: {
+      type: 'object',
+      properties: {
+        event_id: { type: 'string', description: '要删除的日程事件 ID' },
+        calendar_id: { type: 'string', description: '日历 ID，默认 primary' },
+        summary: { type: 'string', description: '日程标题，仅用于确认提示，可选' },
+        need_notification: { type: 'boolean', description: '是否通知参会人，默认由飞书决定' },
+      },
+      required: ['event_id'],
+    },
+    ownerOnly: true,
+    async run({ event_id, calendar_id = 'primary', summary, need_notification }, ctx) {
+      const eventId = String(event_id || '').trim();
+      if (!eventId) return { error: '缺少要删除的日程 event_id。请先查询日程，定位目标事件后再删除。' };
+      const calId = String(calendar_id || 'primary').trim() || 'primary';
+      const a = ['calendar', 'events', 'delete', '--calendar-id', calId, '--event-id', eventId];
+      if (typeof need_notification === 'boolean') a.push('--need-notification', need_notification ? 'true' : 'false');
+      a.push('--as', 'user');
+      const title = summary ? `：「${summary}」` : '';
+      const preview = `将删除日程${title}\nevent_id：${eventId}\ncalendar_id：${calId}\n回复「确认」删除，或「取消」放弃。`;
+      return confirmSingleWrite(ctx, a, preview, 'calendar_delete');
+    },
+  },
+
   // ============ 一等工具：任务（task，ownerOnly，--as user）============
   {
     name: 'task_list',
