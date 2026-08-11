@@ -15,7 +15,7 @@
    │     ├─ Policy Engine（policy.mjs）：身份/数据级别/副作用/信息流强制门禁
    │     └─ 工具集（tools.mjs）：一等工具 + 主人专属元工具
    ├─ 有界事件队列 + 单实例重连 + lark-cli 超时
-   ├─ 三层记忆（memory.mjs）：短期 + 摘要 + facts（串行维护、原子落盘）
+   ├─ 记忆系统（memory.mjs）：短期 + 摘要 + facts/memories + 轻量图谱（串行维护、原子落盘）
    └─ 会话绑定的写操作二次确认
 ```
 
@@ -106,29 +106,30 @@
 | 私聊 | 收到即回 |
 | 群聊 | 仅当 **@机器人** 时响应（结构化 mentions + content 文本兜底，兼容飞书不下发 mentions 的情况） |
 
-## 对话记忆（三层 + 群共享）
+## 对话记忆（三层 + 图谱 + 群共享）
 
 | 层 | 存储 | 写入时机 |
 |----|------|----------|
 | 短期（最近 30 轮原文） | 默认仅内存（重启清空）；`MEMORY_PERSIST_SHORT=on` 时原子落盘、重启恢复 | 每轮实时 |
 | 长期摘要 | 原子落盘（0600） | 有旧对话滑出窗口时增量压缩 |
 | 结构化长期记忆（memories[]，兼容 facts） | 原子落盘（0600） | 每 5 轮抽取、相关性检索、TTL/过期清理 |
+| 轻量知识图谱（graph.edges） | 原子落盘（0600），与场景 JSON 同文件 | 每 5 轮抽取三元组，按实体关系 1~2 跳召回 |
 
 持久化按用户分目录，便于人工查看/修改：
 
 ```
 data/memory/<用户名>_<openid短码>/
   ├── profile.json          身份：姓名/部门/邮箱/openId
-  ├── p2p.json              私聊记忆：{summary, facts, memories[, messages]}
+  ├── p2p.json              私聊记忆：{summary, facts, memories, graph[, messages]}
   └── group_<chatId>.json   该用户在该群里的场景记忆
 
 data/memory/groups/
-  └── group_<chatId>.json   群共享记忆：群主线、公开协作背景、成员角色、群风格等
+  └── group_<chatId>.json   群共享记忆：群主线、公开协作背景、成员角色、群风格、关系图谱等
 ```
 
 主人与访客均享完整三层记忆并落盘，各自按 `sessionKey` 严格隔离（互不串）。
 群聊场景额外维护一份群共享记忆，并在机器人被 @ 时按 `GROUP_CONTEXT_PREFETCH` 自动预取最近群聊上文，帮助 bot 自然接话，而不是只依赖模型临时决定是否读取上下文。
-构造 prompt 时不会全量注入长期记忆：系统会按当前问题做相关性筛选，并用 `MEMORY_CONTEXT_BUDGET_CHARS` 控制 summary/history/memories 的总量；临时任务、决策类记忆会按 TTL 自动过期，长期未命中的非耐久记忆会被清理。
+构造 prompt 时不会全量注入长期记忆：系统会按当前问题做相关性筛选，并用 `MEMORY_CONTEXT_BUDGET_CHARS` 控制 summary/history/memories/graph 的总量；图谱会先命中当前问题相关实体，再带出相邻关系边；临时任务、决策类记忆会按 TTL 自动过期，长期未命中的非耐久记忆会被清理。
 短期落盘（`MEMORY_PERSIST_SHORT=on`）会把最近原文写入场景文件的 `messages` 字段，重启后仍受 TTL 约束——超过 `MEMORY_TTL_MS` 未活动的旧短期不恢复，避免捞回很久以前的对话。
 
 ## 前置条件

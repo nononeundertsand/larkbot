@@ -553,9 +553,10 @@ export async function updateSummary(oldSummary, turns) {
   }
 }
 
-// 关键记忆：从最近对话中抽取结构化事实，与已有 JSON 合并，返回新的 key-value 对象。
-// oldFacts 为已有事实对象；turns 为最近 [{role, content}]。
-export async function extractKeyMemory(oldFacts, turns) {
+// 关键记忆：从最近对话中抽取结构化事实与关系三元组。
+// 兼容旧扁平 key-value；新格式为 {facts:{...}, relations:[{source, relation, target, description?, confidence?}]}。
+// oldFacts 为已有事实对象；oldGraph 为已有轻量图谱；turns 为最近 [{role, content}]。
+export async function extractKeyMemory(oldFacts, turns, oldGraph = {}) {
   if (!llmConfigured() || !turns || turns.length === 0) return oldFacts || {};
   const dialogue = turns
     .map((m) => `${m.role === 'user' ? '用户' : '助理'}：${m.content}`)
@@ -566,16 +567,21 @@ export async function extractKeyMemory(oldFacts, turns) {
         {
           role: 'system',
           content:
-            '你是关键信息抽取器。从对话中提取应长期记住的结构化事实，例如：' +
+            '你是关键信息与关系图谱抽取器。从对话中提取应长期记住的结构化事实，例如：' +
             '姓名/称呼、身份角色、稳定偏好、正在进行的项目、明确的待办或承诺、重要约定等。' +
-            '与【已有事实】合并：新信息补充或覆盖旧的，无变化则保持。' +
-            '输出一个扁平的 JSON 对象（键为简短中文或英文标识，值为字符串）。' +
-            '注意：value 里不要重复字段名或写成“key: value”，例如 member_roles 的值只写角色内容，不要写“member_roles: …”。' +
-            '只保留确实值得长期记住的稳定信息，忽略闲聊。只输出 JSON，不要其它内容。\n' + ANTI_INJECTION_NOTE,
+            '同时抽取实体之间的稳定关系三元组，用于本地知识图谱召回。' +
+            '与【已有事实】和【已有关系】合并：新信息补充或覆盖旧的，无变化则保持。' +
+            '输出 JSON，推荐格式：{"facts":{"简短key":"字符串值"},"relations":[{"source":"实体A","relation":"关系","target":"实体B","description":"可选短说明","confidence":0.75}]}。' +
+            'facts 的 value 里不要重复字段名或写成“key: value”，例如 member_roles 的值只写角色内容，不要写“member_roles: …”。' +
+            'relations 只记录明确出现或强稳定的关系，如 参与/负责/依赖/属于/偏好/决定/待办；不要把临时闲聊、猜测、隐私或凭证写入记忆。' +
+            '只输出 JSON，不要其它内容。\n' + ANTI_INJECTION_NOTE,
         },
         {
           role: 'user',
-          content: `【已有事实】\n${wrapMemoryData(oldFacts || {})}\n\n【最近对话】\n${wrapUntrusted(dialogue)}`,
+          content:
+            `【已有事实】\n${wrapMemoryData(oldFacts || {})}\n\n` +
+            `【已有关系】\n${wrapMemoryData(oldGraph || { edges: [] })}\n\n` +
+            `【最近对话】\n${wrapUntrusted(dialogue)}`,
         },
       ],
       { temperature: 0, task: 'extract' }
@@ -623,7 +629,7 @@ export async function updateGroupSummary(oldSummary, turns) {
   }
 }
 
-export async function extractGroupKeyMemory(oldFacts, turns) {
+export async function extractGroupKeyMemory(oldFacts, turns, oldGraph = {}) {
   if (!llmConfigured() || !turns || turns.length === 0) return oldFacts || {};
   const dialogue = turns
     .map((m) => `${m.role === 'user' ? '群聊/用户' : '助理'}：${m.content}`)
@@ -634,15 +640,19 @@ export async function extractGroupKeyMemory(oldFacts, turns) {
         {
           role: 'system',
           content:
-            '你是群聊共享事实抽取器。从群聊互动中提取对后续群聊有稳定价值的事实。' +
-            '输出扁平 JSON，可包含 group_topic、active_projects、member_roles、tone、standing_decisions 等键。' +
+            '你是群聊共享事实与关系图谱抽取器。从群聊互动中提取对后续群聊有稳定价值的事实和实体关系。' +
+            '输出 JSON，推荐格式：{"facts":{"group_topic":"...","active_projects":"...","member_roles":"...","tone":"...","standing_decisions":"..."},"relations":[{"source":"实体A","relation":"关系","target":"实体B","description":"可选短说明","confidence":0.75}]}。' +
             '注意：value 里不要重复字段名或写成“key: value”，例如 member_roles 的值只写角色内容，不要写“member_roles: …”。' +
+            'relations 可记录群主题、项目、成员公开分工、决策、待办之间的关系，如 讨论/推进/负责/依赖/决定/待办。' +
             '只记录公开群聊中明确出现的稳定信息；不要保存隐私、凭证、八卦、临时情绪或模型自己的推测。' +
-            '与【已有群事实】合并，新信息补充或覆盖旧信息。只输出 JSON，不要其它内容。\n' + ANTI_INJECTION_NOTE,
+            '与【已有群事实】和【已有群关系】合并，新信息补充或覆盖旧信息。只输出 JSON，不要其它内容。\n' + ANTI_INJECTION_NOTE,
         },
         {
           role: 'user',
-          content: `【已有群事实】\n${wrapMemoryData(oldFacts || {})}\n\n【最近群互动】\n${wrapUntrusted(dialogue)}`,
+          content:
+            `【已有群事实】\n${wrapMemoryData(oldFacts || {})}\n\n` +
+            `【已有群关系】\n${wrapMemoryData(oldGraph || { edges: [] })}\n\n` +
+            `【最近群互动】\n${wrapUntrusted(dialogue)}`,
         },
       ],
       { temperature: 0, task: 'extract' }

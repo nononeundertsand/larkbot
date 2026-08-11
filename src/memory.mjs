@@ -3,19 +3,20 @@
 //   1) 短期记忆：滑动窗口，最近 SHORT_TURNS 轮原文，存内存（重启清空）
 //   2) 长期记忆：被挤出窗口的旧对话，用 LLM 压缩成滚动摘要，落盘持久化
 //   3) 关键记忆：结构化事实 JSON（姓名/偏好/项目/待办…），落盘持久化，关键信息不遗忘
+//   4) 轻量知识图谱：本地 JSON 三元组边，表达实体关系，按查询做子图召回
 //
 //   持久化布局（按用户分目录，方便人工查看/调整）：
 //   data/memory/<用户名_openid短码>/
 //     ├── profile.json          用户身份 {name, department, email, openId}
-//     ├── p2p.json              私聊场景 {summary, facts, updatedAt}
-//     └── group_<chatId>.json   各群场景 {summary, facts, updatedAt}
+//     ├── p2p.json              私聊场景 {summary, facts, memories, graph, updatedAt}
+//     └── group_<chatId>.json   各群场景 {summary, facts, memories, graph, updatedAt}
 //   data/memory/groups/
-//     └── group_<chatId>.json   群共享记忆 {summary, facts, updatedAt}
+//     └── group_<chatId>.json   群共享记忆 {summary, facts, memories, graph, updatedAt}
 //   同一用户的所有会话集中在其目录内；短期原文不落盘。
 //
 // 维护时机（省成本）：回复后异步调用 maintainMemory()：
 //   - 有旧轮次滑出窗口时 → 增量更新长期摘要
-//   - 每满 EXTRACT_EVERY 轮 → 抽取/合并关键记忆
+//   - 每满 EXTRACT_EVERY 轮 → 抽取/合并关键记忆与关系边
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
@@ -30,6 +31,9 @@ const EXTRACT_EVERY = Number(process.env.MEMORY_EXTRACT_EVERY || 5); // 每几�
 const CONTEXT_BUDGET_CHARS = Number(process.env.MEMORY_CONTEXT_BUDGET_CHARS || 12000);
 const MEMORY_RELEVANT_LIMIT = Number(process.env.MEMORY_RELEVANT_LIMIT || 8);
 const MEMORY_ITEM_LIMIT = Number(process.env.MEMORY_ITEM_LIMIT || 120);
+const MEMORY_GRAPH_EDGE_LIMIT = Number(process.env.MEMORY_GRAPH_EDGE_LIMIT || 240);
+const MEMORY_GRAPH_RELEVANT_LIMIT = Number(process.env.MEMORY_GRAPH_RELEVANT_LIMIT || Math.max(8, MEMORY_RELEVANT_LIMIT));
+const MEMORY_GRAPH_HOPS = Math.max(0, Number(process.env.MEMORY_GRAPH_HOPS || 2));
 const MEMORY_TEMP_TTL_MS = Number(process.env.MEMORY_TEMP_TTL_MS || 3 * 24 * 3600 * 1000);
 const MEMORY_TASK_TTL_MS = Number(process.env.MEMORY_TASK_TTL_MS || 14 * 24 * 3600 * 1000);
 const MEMORY_DECISION_TTL_MS = Number(process.env.MEMORY_DECISION_TTL_MS || 180 * 24 * 3600 * 1000);
@@ -230,6 +234,230 @@ function formatMemoryBrief(items) {
     .map((m) => `- [${m.type || 'fact'}|${m.scope || 'session'}|${m.source || 'unknown'}|${Math.round((Number(m.confidence) || 0) * 100)}%] ${stripKeyPrefix(memoryContent(m), m.key)}`)
     .join('\n');
 }
+function clampConfidence(value, fallback = 0.75) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : fallback;
+}
+function entityLabel(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+function graphEntityKey(value) {
+  return entityLabel(value).toLowerCase().replace(/\s+/g, '');
+}
+function graphPredicate(value) {
+  return entityLabel(value).slice(0, 48);
+}
+function graphEdgeText(edge) {
+  return `${edge.subject || ''} ${edge.predicate || ''} ${edge.object || ''} ${edge.description || ''}`.trim();
+}
+function graphEdgeKey(edge) {
+  return [
+    edge.scope || '',
+    graphEntityKey(edge.subject),
+    String(edge.predicate || '').toLowerCase(),
+    graphEntityKey(edge.object),
+  ].join('|');
+}
+function rawGraphEdges(raw) {
+  if (Array.isArray(raw)) return raw;
+  if (!raw || typeof raw !== 'object') return [];
+  if (Array.isArray(raw.edges)) return raw.edges;
+  if (Array.isArray(raw.relations)) return raw.relations;
+  if (Array.isArray(raw.graphEdges)) return raw.graphEdges;
+  if (Array.isArray(raw.graph_edges)) return raw.graph_edges;
+  if (raw.graph && typeof raw.graph === 'object') return rawGraphEdges(raw.graph);
+  return [];
+}
+function normalizeGraphEdges(rawEdges, { scope = 'session', origin = 'llm' } = {}) {
+  const now = nowIso();
+  const edges = [];
+  for (const raw of Array.isArray(rawEdges) ? rawEdges : []) {
+    if (!raw || typeof raw !== 'object') continue;
+    const subject = entityLabel(raw.subject ?? raw.source ?? raw.from ?? raw.head);
+    const predicate = graphPredicate(raw.predicate ?? raw.relation ?? raw.rel ?? raw.type);
+    const object = entityLabel(raw.object ?? raw.target ?? raw.to ?? raw.tail);
+    if (!subject || !predicate || !object) continue;
+    const relationType = inferMemoryType(predicate, `${subject} ${object} ${raw.description || raw.note || ''}`);
+    edges.push({
+      id: raw.id || randomUUID(),
+      scope: raw.scope || scope,
+      subject,
+      predicate,
+      object,
+      description: String(raw.description || raw.note || '').trim(),
+      confidence: clampConfidence(raw.confidence, origin === 'legacy' ? 0.65 : 0.75),
+      origin: raw.origin || raw.memorySource || origin,
+      createdAt: raw.createdAt || raw.updatedAt || now,
+      updatedAt: raw.updatedAt || raw.createdAt || now,
+      expiresAt: raw.expiresAt === undefined ? defaultExpiresAt(relationType) : raw.expiresAt,
+      lastUsedAt: raw.lastUsedAt || '',
+      useCount: Math.max(0, Number(raw.useCount) || 0),
+    });
+  }
+  return edges;
+}
+function mergeGraphEdges(existing, incoming) {
+  const byKey = new Map();
+  for (const edge of [...(existing || []), ...(incoming || [])]) {
+    if (!edge?.subject || !edge?.predicate || !edge?.object) continue;
+    const key = graphEdgeKey(edge);
+    const prev = byKey.get(key);
+    if (prev && edge.origin === 'legacy' && prev.origin !== 'legacy') continue;
+    if (!prev || prev.origin === 'legacy' || timeMs(edge.updatedAt) >= timeMs(prev.updatedAt)) {
+      byKey.set(key, {
+        ...prev,
+        ...edge,
+        id: prev?.id || edge.id || randomUUID(),
+        useCount: Math.max(Number(prev?.useCount) || 0, Number(edge.useCount) || 0),
+        lastUsedAt: edge.lastUsedAt || prev?.lastUsedAt || '',
+      });
+    }
+  }
+  return [...byKey.values()];
+}
+function pruneGraphEdges(edges) {
+  const now = Date.now();
+  return (edges || [])
+    .filter((edge) => {
+      if (!edge?.subject || !edge?.predicate || !edge?.object) return false;
+      if (edge.expiresAt && timeMs(edge.expiresAt) > 0 && timeMs(edge.expiresAt) <= now) return false;
+      const relationType = inferMemoryType(edge.predicate, graphEdgeText(edge));
+      const durable = ['fact', 'preference', 'relationship', 'decision'].includes(relationType);
+      const last = timeMs(edge.lastUsedAt) || timeMs(edge.updatedAt) || timeMs(edge.createdAt);
+      if (!durable && last > 0 && now - last > MEMORY_STALE_MS && (Number(edge.useCount) || 0) === 0) return false;
+      return true;
+    })
+    .sort((a, b) => {
+      const scoreA = (Number(a.confidence) || 0) + Math.min(0.3, (Number(a.useCount) || 0) * 0.02) + (timeMs(a.updatedAt) / 1e14);
+      const scoreB = (Number(b.confidence) || 0) + Math.min(0.3, (Number(b.useCount) || 0) * 0.02) + (timeMs(b.updatedAt) / 1e14);
+      return scoreB - scoreA;
+    })
+    .slice(0, MEMORY_GRAPH_EDGE_LIMIT);
+}
+function normalizeGraph(raw, { scope = 'session', origin = 'legacy' } = {}) {
+  return { edges: pruneGraphEdges(mergeGraphEdges([], normalizeGraphEdges(rawGraphEdges(raw), { scope, origin }))) };
+}
+function graphNodesFromEdges(edges) {
+  const byKey = new Map();
+  for (const edge of edges || []) {
+    for (const label of [edge.subject, edge.object]) {
+      const key = graphEntityKey(label);
+      if (!key) continue;
+      const prev = byKey.get(key);
+      byKey.set(key, {
+        id: prev?.id || key,
+        label: prev?.label || label,
+        scope: edge.scope || prev?.scope || 'session',
+        degree: (prev?.degree || 0) + 1,
+        confidence: Math.max(Number(prev?.confidence) || 0, Number(edge.confidence) || 0),
+        updatedAt: timeMs(edge.updatedAt) >= timeMs(prev?.updatedAt) ? edge.updatedAt : prev?.updatedAt || edge.updatedAt,
+        lastUsedAt: timeMs(edge.lastUsedAt) >= timeMs(prev?.lastUsedAt) ? edge.lastUsedAt : prev?.lastUsedAt || '',
+        useCount: (Number(prev?.useCount) || 0) + (Number(edge.useCount) || 0),
+      });
+    }
+  }
+  return [...byKey.values()]
+    .sort((a, b) => b.degree - a.degree || timeMs(b.updatedAt) - timeMs(a.updatedAt))
+    .slice(0, MEMORY_GRAPH_EDGE_LIMIT * 2);
+}
+function graphToPersist(graph) {
+  const edges = pruneGraphEdges(graph?.edges || []);
+  return { nodes: graphNodesFromEdges(edges), edges };
+}
+function graphForPrompt(graph) {
+  const edges = pruneGraphEdges(graph?.edges || [])
+    .slice(0, 40)
+    .map(({ subject, predicate, object, description, confidence }) => ({
+      subject,
+      predicate,
+      object,
+      description,
+      confidence,
+    }));
+  return { edges };
+}
+function splitExtractedKnowledge(raw, { scope = 'session' } = {}) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { facts: {}, edges: [] };
+  const graphKeys = new Set(['relations', 'edges', 'graph', 'graphEdges', 'graph_edges', 'nodes']);
+  const facts = raw.facts && typeof raw.facts === 'object' && !Array.isArray(raw.facts)
+    ? raw.facts
+    : {};
+  if (!raw.facts || typeof raw.facts !== 'object' || Array.isArray(raw.facts)) {
+    for (const [key, value] of Object.entries(raw)) {
+      if (graphKeys.has(key) || value == null) continue;
+      facts[key] = value;
+    }
+  }
+  return {
+    facts,
+    edges: normalizeGraphEdges(rawGraphEdges(raw), { scope, origin: 'llm' }),
+  };
+}
+function graphOverlap(edge, queryTokens) {
+  const textTokens = tokenize(graphEdgeText(edge));
+  let overlap = 0;
+  for (const t of queryTokens) if (textTokens.has(t)) overlap += 1;
+  return overlap;
+}
+function graphEndpointKeys(edge) {
+  return [graphEntityKey(edge.subject), graphEntityKey(edge.object)].filter(Boolean);
+}
+function selectRelevantGraphEdges(edges, query, { limit = MEMORY_GRAPH_RELEVANT_LIMIT, budgetChars = 2000, hops = MEMORY_GRAPH_HOPS } = {}) {
+  const queryTokens = tokenize(query);
+  const scored = pruneGraphEdges(edges)
+    .map((edge, idx) => {
+      const overlap = graphOverlap(edge, queryTokens);
+      return { edge, overlap, score: relevanceScore(edge, overlap, idx) };
+    });
+  const hasOverlap = queryTokens.size > 0 && scored.some((x) => x.overlap > 0);
+  const direct = scored
+    .filter((x) => !hasOverlap || x.overlap > 0)
+    .sort((a, b) => b.score - a.score);
+  const selected = [];
+  const selectedKeys = new Set();
+  let used = 0;
+  const add = (edge) => {
+    const key = graphEdgeKey(edge);
+    if (selectedKeys.has(key)) return false;
+    const len = graphEdgeText(edge).length + 96;
+    if (selected.length >= limit || used + len > budgetChars) return false;
+    edge.lastUsedAt = nowIso();
+    edge.useCount = (Number(edge.useCount) || 0) + 1;
+    selected.push(edge);
+    selectedKeys.add(key);
+    used += len;
+    return true;
+  };
+
+  let frontier = new Set();
+  for (const { edge } of direct) {
+    if (!add(edge)) break;
+    for (const key of graphEndpointKeys(edge)) frontier.add(key);
+  }
+  for (let hop = 0; hop < hops && frontier.size > 0 && selected.length < limit; hop++) {
+    const nextFrontier = new Set();
+    const connected = scored
+      .filter(({ edge }) => !selectedKeys.has(graphEdgeKey(edge)) && graphEndpointKeys(edge).some((key) => frontier.has(key)))
+      .sort((a, b) => b.score - a.score);
+    for (const { edge } of connected) {
+      if (!add(edge)) break;
+      for (const key of graphEndpointKeys(edge)) nextFrontier.add(key);
+    }
+    frontier = nextFrontier;
+  }
+  return selected;
+}
+function formatGraphBrief(edges) {
+  return (edges || [])
+    .map((edge) => {
+      const desc = edge.description ? `（${edge.description}）` : '';
+      return `- [relation|${edge.scope || 'session'}|${edge.origin || 'unknown'}|${Math.round((Number(edge.confidence) || 0) * 100)}%] ${edge.subject} --${edge.predicate}--> ${edge.object}${desc}`;
+    })
+    .join('\n');
+}
+function formatKnowledgeBrief(items, edges) {
+  return [formatMemoryBrief(items), formatGraphBrief(edges)].filter(Boolean).join('\n');
+}
 function clipHistory(messages, budgetChars) {
   const out = [];
   let used = 0;
@@ -246,7 +474,8 @@ function clipHistory(messages, budgetChars) {
 
 // 内存态：id -> {
 //   desc, updatedAt, messages:[{role,content}]（短期）,
-//   summary:string（长期）, facts:{}（关键）, evicted:[]（待压缩）, turnsSinceExtract
+//   summary:string（长期）, facts:{}（关键）, graph:{edges:[]}（关系图谱）,
+//   evicted:[]（待压缩）, turnsSinceExtract
 // }
 const store = new Map();
 const groupStore = new Map();
@@ -323,6 +552,9 @@ function loadPersisted(desc, s) {
       s.memories = normalizeMemoryItems(data.memories, s.facts, {
         scope: desc.chatType === 'group' ? 'group_user' : 'p2p',
       });
+      s.graph = normalizeGraph(data.graph || data.graphEdges || data.graph_edges, {
+        scope: desc.chatType === 'group' ? 'group_user' : 'p2p',
+      });
       // 短期原文恢复：仅当开关开启、磁盘上有 messages，且最近活动未超过 TTL（避免捞回很久以前的对话）。
       if (PERSIST_SHORT && Array.isArray(data.messages) && data.messages.length) {
         const savedAt = data.updatedAt ? Date.parse(data.updatedAt) : 0;
@@ -351,6 +583,8 @@ function persist(desc, s) {
       memories: pruneMemories(s.memories || []),
       updatedAt: new Date().toISOString(),
     };
+    const graph = graphToPersist(s.graph);
+    if (graph.edges.length) payload.graph = graph;
     if (PERSIST_SHORT) payload.messages = (s.messages || []).slice(-SHORT_TURNS * 2);
     atomicWriteJson(sceneFile(desc), payload);
     persistProfile(desc);
@@ -367,6 +601,7 @@ function loadPersistedGroup(chatId, s) {
     s.summary = typeof data.summary === 'string' ? data.summary : '';
     s.facts = data.facts && typeof data.facts === 'object' ? data.facts : {};
     s.memories = normalizeMemoryItems(data.memories, s.facts, { scope: 'group' });
+    s.graph = normalizeGraph(data.graph || data.graphEdges || data.graph_edges, { scope: 'group' });
     if (PERSIST_SHORT && Array.isArray(data.messages) && data.messages.length) {
       const savedAt = data.updatedAt ? Date.parse(data.updatedAt) : 0;
       if (!savedAt || Date.now() - savedAt <= TTL_MS) {
@@ -390,6 +625,8 @@ function persistGroup(chatId, s) {
       memories: pruneMemories(s.memories || []),
       updatedAt: new Date().toISOString(),
     };
+    const graph = graphToPersist(s.graph);
+    if (graph.edges.length) payload.graph = graph;
     if (PERSIST_SHORT) payload.messages = (s.messages || []).slice(-SHORT_TURNS * 2);
     atomicWriteJson(groupFile(chatId), payload);
   } catch (err) {
@@ -407,9 +644,10 @@ function getSession(key, { persist: usePersist } = {}) {
     s.evicted = [];
   }
   if (!s) {
-    s = { desc, updatedAt: Date.now(), messages: [], summary: '', facts: {}, memories: [], evicted: [], turnsSinceExtract: 0 };
+    s = { desc, updatedAt: Date.now(), messages: [], summary: '', facts: {}, memories: [], graph: { edges: [] }, evicted: [], turnsSinceExtract: 0 };
     if (usePersist) loadPersisted(desc, s);
     s.memories = pruneMemories(s.memories || []);
+    s.graph = normalizeGraph(s.graph, { scope: desc.chatType === 'group' ? 'group_user' : 'p2p' });
     s.facts = memoriesToFacts(s.memories.length ? s.memories : factsToMemoryItems(s.facts, {
       scope: desc.chatType === 'group' ? 'group_user' : 'p2p',
       source: 'legacy',
@@ -423,6 +661,7 @@ function getSession(key, { persist: usePersist } = {}) {
   } else {
     // 身份资料可能补全或更新，保持目录描述与最新上下文一致。
     s.desc = { ...s.desc, ...desc };
+    if (!s.graph) s.graph = { edges: [] };
   }
   return s;
 }
@@ -435,9 +674,10 @@ function getGroupSession(chatId, { persist: usePersist } = {}) {
     s.evicted = [];
   }
   if (!s) {
-    s = { chatId: id, updatedAt: Date.now(), messages: [], summary: '', facts: {}, memories: [], evicted: [], turnsSinceExtract: 0 };
+    s = { chatId: id, updatedAt: Date.now(), messages: [], summary: '', facts: {}, memories: [], graph: { edges: [] }, evicted: [], turnsSinceExtract: 0 };
     if (usePersist) loadPersistedGroup(id, s);
     s.memories = pruneMemories(s.memories || []);
+    s.graph = normalizeGraph(s.graph, { scope: 'group' });
     s.facts = memoriesToFacts(s.memories.length ? s.memories : factsToMemoryItems(s.facts, { scope: 'group', source: 'legacy' }));
     groupStore.set(id, s);
     if (groupStore.size > MAX_SESSIONS) {
@@ -445,6 +685,8 @@ function getGroupSession(chatId, { persist: usePersist } = {}) {
       for (const [k, v] of groupStore) if (v.updatedAt < oldest) { oldest = v.updatedAt; oldestKey = k; }
       if (oldestKey) groupStore.delete(oldestKey);
     }
+  } else if (!s.graph) {
+    s.graph = { edges: [] };
   }
   return s;
 }
@@ -453,15 +695,24 @@ function getGroupSession(chatId, { persist: usePersist } = {}) {
 export function buildContext(key, { persist: usePersist = false, query = '', budgetChars = CONTEXT_BUDGET_CHARS } = {}) {
   const s = getSession(key, { persist: usePersist });
   const memoryBudget = Math.max(1200, Math.floor(budgetChars * 0.25));
+  const graphBudget = Math.max(500, Math.floor(memoryBudget * 0.45));
+  const factBudget = Math.max(500, memoryBudget - graphBudget);
   const historyBudget = Math.max(2400, Math.floor(budgetChars * 0.55));
   const summaryBudget = Math.max(600, Math.floor(budgetChars * 0.12));
+  const q = query || s.messages.at(-1)?.content || '';
   const selected = usePersist
-    ? selectRelevantMemories(s.memories || [], query || s.messages.at(-1)?.content || '', { budgetChars: memoryBudget })
+    ? selectRelevantMemories(s.memories || [], q, { budgetChars: factBudget })
     : [];
+  const selectedGraph = usePersist
+    ? selectRelevantGraphEdges(s.graph?.edges || [], q, { budgetChars: graphBudget })
+    : [];
+  const graphBrief = formatGraphBrief(selectedGraph);
   return {
     facts: usePersist ? memoriesToFacts(selected) : {},
     memories: selected,
-    memoryBrief: formatMemoryBrief(selected),
+    graphEdges: selectedGraph,
+    graphBrief,
+    memoryBrief: formatKnowledgeBrief(selected, selectedGraph),
     summary: usePersist ? clipText(s.summary || '', summaryBudget) : '',
     history: clipHistory(s.messages, historyBudget),
   };
@@ -470,19 +721,31 @@ export function buildContext(key, { persist: usePersist = false, query = '', bud
 export function buildGroupContext(chatId, { persist: usePersist = false, query = '', budgetChars = Math.floor(CONTEXT_BUDGET_CHARS * 0.45) } = {}) {
   const s = getGroupSession(chatId, { persist: usePersist });
   const memoryBudget = Math.max(1000, Math.floor(budgetChars * 0.35));
+  const graphBudget = Math.max(450, Math.floor(memoryBudget * 0.45));
+  const factBudget = Math.max(450, memoryBudget - graphBudget);
   const recentBudget = Math.max(1200, Math.floor(budgetChars * 0.45));
   const summaryBudget = Math.max(500, Math.floor(budgetChars * 0.15));
+  const q = query || s.messages.at(-1)?.content || '';
   const selected = usePersist
-    ? selectRelevantMemories(s.memories || [], query || s.messages.at(-1)?.content || '', {
+    ? selectRelevantMemories(s.memories || [], q, {
       limit: Math.max(4, Math.floor(MEMORY_RELEVANT_LIMIT / 2)),
-      budgetChars: memoryBudget,
+      budgetChars: factBudget,
     })
     : [];
+  const selectedGraph = usePersist
+    ? selectRelevantGraphEdges(s.graph?.edges || [], q, {
+      limit: Math.max(4, Math.floor(MEMORY_GRAPH_RELEVANT_LIMIT / 2)),
+      budgetChars: graphBudget,
+    })
+    : [];
+  const graphBrief = formatGraphBrief(selectedGraph);
   return {
     groupSummary: usePersist ? clipText(s.summary || '', summaryBudget) : '',
     groupFacts: usePersist ? memoriesToFacts(selected) : {},
     groupMemories: selected,
-    groupMemoryBrief: formatMemoryBrief(selected),
+    groupGraphEdges: selectedGraph,
+    groupGraphBrief: graphBrief,
+    groupMemoryBrief: formatKnowledgeBrief(selected, selectedGraph),
     groupRecent: clipHistory(s.messages.slice(-12), recentBudget),
   };
 }
@@ -556,15 +819,20 @@ async function doMaintainMemory(key) {
   if (s.turnsSinceExtract >= EXTRACT_EVERY && s.messages.length > 0) {
     s.turnsSinceExtract = 0;
     const snapshot = s.messages.slice();
-    const extracted = await extractKeyMemory(s.facts, snapshot);
     const scope = desc.chatType === 'group' ? 'group_user' : 'p2p';
-    s.memories = mergeMemories(s.memories || [], factsToMemoryItems(extracted, { scope, source: 'llm' }));
+    const extracted = await extractKeyMemory(s.facts, snapshot, graphForPrompt(s.graph));
+    const { facts, edges } = splitExtractedKnowledge(extracted, { scope });
+    s.memories = mergeMemories(s.memories || [], factsToMemoryItems(facts, { scope, source: 'llm' }));
+    s.graph = { edges: mergeGraphEdges(s.graph?.edges || [], edges) };
     changed = true;
   }
   const before = (s.memories || []).length;
+  const beforeGraph = (s.graph?.edges || []).length;
   s.memories = pruneMemories(s.memories || []);
+  s.graph = graphToPersist(s.graph);
   s.facts = memoriesToFacts(s.memories);
   if (s.memories.length !== before) changed = true;
+  if ((s.graph?.edges || []).length !== beforeGraph) changed = true;
   if (changed) persist(s.desc, s);
 }
 
@@ -583,14 +851,19 @@ async function doMaintainGroupMemory(chatId) {
     s.turnsSinceExtract = 0;
     const snapshot = s.messages.slice(-Math.min(s.messages.length, SHORT_TURNS * 2));
     s.summary = await updateGroupSummary(s.summary, snapshot);
-    const extracted = await extractGroupKeyMemory(s.facts, snapshot);
-    s.memories = mergeMemories(s.memories || [], factsToMemoryItems(extracted, { scope: 'group', source: 'llm' }));
+    const extracted = await extractGroupKeyMemory(s.facts, snapshot, graphForPrompt(s.graph));
+    const { facts, edges } = splitExtractedKnowledge(extracted, { scope: 'group' });
+    s.memories = mergeMemories(s.memories || [], factsToMemoryItems(facts, { scope: 'group', source: 'llm' }));
+    s.graph = { edges: mergeGraphEdges(s.graph?.edges || [], edges) };
     changed = true;
   }
   const before = (s.memories || []).length;
+  const beforeGraph = (s.graph?.edges || []).length;
   s.memories = pruneMemories(s.memories || []);
+  s.graph = graphToPersist(s.graph);
   s.facts = memoriesToFacts(s.memories);
   if (s.memories.length !== before) changed = true;
+  if ((s.graph?.edges || []).length !== beforeGraph) changed = true;
   if (changed) persistGroup(s.chatId, s);
 }
 

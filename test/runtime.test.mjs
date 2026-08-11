@@ -208,6 +208,81 @@ test('结构化长期记忆按相关性检索并遗忘过期项', async () => {
   }
 });
 
+test('轻量知识图谱按实体关系召回相邻记忆', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'larkbot-graph-memory-'));
+  process.env.MEMORY_DATA_DIR = dir;
+  process.env.MEMORY_CONTEXT_BUDGET_CHARS = '2400';
+  process.env.MEMORY_GRAPH_HOPS = '1';
+  const senderId = 'ou_graph_user';
+  const userDir = join(dir, '图谱用户_aph_user');
+  mkdirSync(userDir, { recursive: true });
+  writeFileSync(join(userDir, 'p2p.json'), JSON.stringify({
+    scene: 'p2p',
+    chatType: 'p2p',
+    summary: '',
+    facts: {},
+    memories: [],
+    graph: {
+      edges: [
+        {
+          id: 'e_project',
+          scope: 'p2p',
+          source: 'larkbot记忆系统',
+          relation: '升级为',
+          target: '知识图谱召回',
+          description: '用三元组表达复杂知识',
+          confidence: 0.95,
+          createdAt: '2026-01-01T00:00:00.000Z',
+          updatedAt: '2026-01-02T00:00:00.000Z',
+        },
+        {
+          id: 'e_owner',
+          scope: 'p2p',
+          source: 'larkbot记忆系统',
+          relation: '服务对象',
+          target: '刘威',
+          description: '记忆升级评估人',
+          confidence: 0.9,
+          createdAt: '2026-01-01T00:00:00.000Z',
+          updatedAt: '2026-01-02T00:00:00.000Z',
+        },
+        {
+          id: 'e_noise',
+          scope: 'p2p',
+          source: '茶水间',
+          relation: '摆放',
+          target: '咖啡机',
+          description: '无关设施信息',
+          confidence: 0.8,
+          createdAt: '2026-01-01T00:00:00.000Z',
+          updatedAt: '2026-01-02T00:00:00.000Z',
+        },
+      ],
+    },
+    updatedAt: new Date().toISOString(),
+  }));
+
+  try {
+    const memory = await import(`../src/memory.mjs?graph=${Date.now()}`);
+    const key = memory.sessionKey({
+      chatType: 'p2p',
+      senderId,
+      senderName: '图谱用户',
+    });
+    const ctx = memory.buildContext(key, {
+      persist: true,
+      query: '知识图谱召回方案如何设计',
+      budgetChars: 2400,
+    });
+    assert.match(ctx.graphBrief, /larkbot记忆系统 --升级为--> 知识图谱召回/);
+    assert.match(ctx.graphBrief, /larkbot记忆系统 --服务对象--> 刘威/);
+    assert.match(ctx.memoryBrief, /relation\|p2p/);
+    assert.doesNotMatch(ctx.graphBrief, /咖啡机/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('结构化记忆加载时清洗重复 key 前缀并合并同 key 记忆', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'larkbot-memory-prefix-'));
   process.env.MEMORY_DATA_DIR = dir;
