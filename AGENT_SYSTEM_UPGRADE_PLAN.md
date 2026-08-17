@@ -40,7 +40,11 @@
   - 同 subject/predicate 多 object 的图谱边会进入 `conflicted`，别名边不误判为冲突
   - `conflicted/superseded/quarantined` 默认不注入上下文，也不会进入维护抽取器的 graph prompt
   - 已通过 `npm run check` 和 `npm test`（78 tests）
-- P1-5 Hybrid Retrieval：待开始。
+- P1-5 Hybrid Retrieval：已完成第一阶段。
+  - 长期记忆召回已从简单 overlap 升级为本地 BM25 + confidence + recency + useCount 的混合排序
+  - 图谱召回已加入 BM25、alias 扩展、多跳 graph distance 惩罚，降低无关边污染
+  - 第一阶段保持零外部依赖，embedding cache 作为后续可选阶段
+  - 已通过 `npm run check` 和记忆相关定向测试
 
 ## 当前基线
 
@@ -357,17 +361,17 @@ P1 目标是让记忆从“能保存”升级到“可治理、可解释、可�
 任务清单：
 
 - 第一阶段不引入外部向量库：
-  - 实现本地 BM25 或增强 token scoring
-  - graph alias 扩展召回
+  - 实现本地 BM25 或增强 token scoring（已完成）
+  - graph alias 扩展召回（已完成）
 - 第二阶段可选引入本地 embedding cache：
   - 离线环境可关闭
   - embedding 结果落盘
 - 召回结果统一排序：
-  - lexical score
-  - graph distance
-  - recency
-  - confidence
-  - useCount
+  - lexical score（已完成：BM25 + overlap）
+  - graph distance（已完成：多跳边距离惩罚）
+  - recency（已完成）
+  - confidence（已完成）
+  - useCount（已完成）
 
 验收标准：
 

@@ -69,7 +69,7 @@ function factValueToContent(key, value) {
   const raw = typeof value === 'string' ? value : JSON.stringify(value);
   return stripKeyPrefix(raw, key);
 }
-function tokenize(text) {
+function tokenList(text) {
   const s = String(text || '').toLowerCase();
   const latin = s.match(/[a-z0-9_]{2,}/g) || [];
   const cjk = s.match(/[\u4e00-\u9fa5]{2,}/g) || [];
@@ -78,7 +78,10 @@ function tokenize(text) {
     for (let i = 0; i < part.length - 1; i++) out.push(part.slice(i, i + 2));
     return out;
   });
-  return new Set([...latin, ...chars].filter(Boolean));
+  return [...latin, ...chars].filter(Boolean);
+}
+function tokenize(text) {
+  return new Set(tokenList(text));
 }
 function inferMemoryType(key, value) {
   const text = `${key} ${value}`.toLowerCase();
@@ -336,17 +339,78 @@ function relevanceScore(item, overlap, fallbackRank) {
   const used = Math.min(0.4, (Number(item.useCount) || 0) * 0.04);
   return overlap * 3 + confidence + used + recency * 0.2 - fallbackRank * 0.001;
 }
+function countTerms(tokens) {
+  const counts = new Map();
+  for (const token of tokens || []) counts.set(token, (counts.get(token) || 0) + 1);
+  return counts;
+}
+function buildBm25Corpus(items, textOf) {
+  const docs = (items || []).map((item, idx) => {
+    const tokens = tokenList(textOf(item));
+    return {
+      item,
+      idx,
+      len: tokens.length || 1,
+      counts: countTerms(tokens),
+      unique: new Set(tokens),
+    };
+  });
+  const df = new Map();
+  for (const doc of docs) {
+    for (const token of doc.unique) df.set(token, (df.get(token) || 0) + 1);
+  }
+  const avgLen = docs.length
+    ? docs.reduce((sum, doc) => sum + doc.len, 0) / docs.length
+    : 1;
+  return { docs, df, avgLen: avgLen || 1, total: docs.length || 1 };
+}
+function bm25Score(doc, queryTokens, corpus) {
+  const k1 = 1.2;
+  const b = 0.75;
+  let score = 0;
+  for (const token of queryTokens || []) {
+    const freq = doc.counts.get(token) || 0;
+    if (!freq) continue;
+    const df = corpus.df.get(token) || 0;
+    const idf = Math.log(1 + (corpus.total - df + 0.5) / (df + 0.5));
+    const denom = freq + k1 * (1 - b + b * (doc.len / corpus.avgLen));
+    score += idf * ((freq * (k1 + 1)) / denom);
+  }
+  return score;
+}
+function recencyScore(item) {
+  const ts = timeMs(item?.updatedAt) || timeMs(item?.createdAt);
+  if (!ts) return 0;
+  const ageDays = Math.max(0, (Date.now() - ts) / (24 * 3600 * 1000));
+  return 1 / (1 + ageDays / 30);
+}
+function metadataScore(item) {
+  return (Number(item?.confidence) || 0) * 1.2
+    + Math.min(0.5, (Number(item?.useCount) || 0) * 0.05)
+    + recencyScore(item) * 0.35;
+}
+function hybridScore(item, { bm25 = 0, overlap = 0, graphDistance = 0, fallbackRank = 0 } = {}) {
+  const distancePenalty = Math.max(0, graphDistance) * 0.35;
+  return bm25 * 2.4
+    + overlap * 0.7
+    + metadataScore(item)
+    - distancePenalty
+    - fallbackRank * 0.001;
+}
 function selectRelevantMemories(items, query, { limit = MEMORY_RELEVANT_LIMIT, budgetChars = 2400 } = {}) {
-  const queryTokens = tokenize(query);
-  const scored = pruneMemories(items)
-    .filter(memoryIsActive)
-    .map((item, idx) => {
-      const overlap = memoryOverlap(item, queryTokens);
-      return { item, overlap, score: relevanceScore(item, overlap, idx) };
-    });
-  const hasOverlap = queryTokens.size > 0 && scored.some((x) => x.overlap > 0);
+  const queryTokens = [...tokenize(query)];
+  const corpus = buildBm25Corpus(
+    pruneMemories(items).filter(memoryIsActive),
+    (item) => `${item.key || ''} ${item.content || ''} ${item.type || ''}`,
+  );
+  const scored = corpus.docs.map((doc) => {
+    const overlap = memoryOverlap(doc.item, new Set(queryTokens));
+    const bm25 = bm25Score(doc, queryTokens, corpus);
+    return { item: doc.item, overlap, bm25, score: hybridScore(doc.item, { bm25, overlap, fallbackRank: doc.idx }) };
+  });
+  const hasOverlap = queryTokens.length > 0 && scored.some((x) => x.overlap > 0 || x.bm25 > 0);
   const ranked = scored
-    .filter((x) => !hasOverlap || x.overlap > 0)
+    .filter((x) => !hasOverlap || x.overlap > 0 || x.bm25 > 0)
     .sort((a, b) => b.score - a.score);
   const out = [];
   let used = 0;
@@ -638,16 +702,25 @@ function graphEndpointKeys(edge) {
 }
 function selectRelevantGraphEdges(edges, query, { limit = MEMORY_GRAPH_RELEVANT_LIMIT, budgetChars = 2000, hops = MEMORY_GRAPH_HOPS } = {}) {
   const activeEdges = pruneGraphEdges(edges).filter(graphEdgeIsActive);
-  const queryTokens = tokenize(expandGraphQueryWithAliases(query, activeEdges));
-  const scored = activeEdges
-    .map((edge, idx) => {
-      const overlap = graphOverlap(edge, queryTokens);
-      return { edge, overlap, score: relevanceScore(edge, overlap, idx) };
+  const queryTokens = [...tokenize(expandGraphQueryWithAliases(query, activeEdges))];
+  const queryTokenSet = new Set(queryTokens);
+  const corpus = buildBm25Corpus(activeEdges, graphEdgeText);
+  const scored = corpus.docs
+    .map((doc) => {
+      const overlap = graphOverlap(doc.item, queryTokenSet);
+      const bm25 = bm25Score(doc, queryTokens, corpus);
+      return { edge: doc.item, overlap, bm25, fallbackRank: doc.idx };
     });
-  const hasOverlap = queryTokens.size > 0 && scored.some((x) => x.overlap > 0);
+  const scoreEdge = (item, graphDistance = 0) => hybridScore(item.edge, {
+    bm25: item.bm25,
+    overlap: item.overlap,
+    graphDistance,
+    fallbackRank: item.fallbackRank,
+  });
+  const hasOverlap = queryTokens.length > 0 && scored.some((x) => x.overlap > 0 || x.bm25 > 0);
   const direct = scored
-    .filter((x) => !hasOverlap || x.overlap > 0)
-    .sort((a, b) => b.score - a.score);
+    .filter((x) => !hasOverlap || x.overlap > 0 || x.bm25 > 0)
+    .sort((a, b) => scoreEdge(b, 0) - scoreEdge(a, 0));
   const selected = [];
   const selectedKeys = new Set();
   let used = 0;
@@ -673,7 +746,7 @@ function selectRelevantGraphEdges(edges, query, { limit = MEMORY_GRAPH_RELEVANT_
     const nextFrontier = new Set();
     const connected = scored
       .filter(({ edge }) => !selectedKeys.has(graphEdgeKey(edge)) && graphEndpointKeys(edge).some((key) => frontier.has(key)))
-      .sort((a, b) => b.score - a.score);
+      .sort((a, b) => scoreEdge(b, hop + 1) - scoreEdge(a, hop + 1));
     for (const { edge } of connected) {
       if (!add(edge)) break;
       for (const key of graphEndpointKeys(edge)) nextFrontier.add(key);
@@ -1147,4 +1220,6 @@ export const __testing = Object.freeze({
   mergeGraphEdges,
   normalizeMemoryItems,
   normalizeGraphEdges,
+  selectRelevantMemories,
+  selectRelevantGraphEdges,
 });
