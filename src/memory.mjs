@@ -183,6 +183,9 @@ function normalizeMemoryItems(rawItems, legacyFacts, { scope = 'session' } = {})
       confidence: Number.isFinite(Number(item.confidence)) ? Math.max(0, Math.min(1, Number(item.confidence))) : 0.7,
       status: item.status || 'active',
       policyReason: item.policyReason || '',
+      conflictWith: Array.isArray(item.conflictWith) ? item.conflictWith : [],
+      conflictReason: item.conflictReason || '',
+      supersededBy: item.supersededBy || '',
       sourceSessionId: item.sourceSessionId || '',
       sourceMessageIds: Array.isArray(item.sourceMessageIds) ? item.sourceMessageIds : [],
       sourceTextHash: item.sourceTextHash || '',
@@ -198,8 +201,61 @@ function normalizeMemoryItems(rawItems, legacyFacts, { scope = 'session' } = {})
   }
   return pruneMemories(mergeMemories(items, factsToMemoryItems(legacyFacts, { scope, source: 'legacy' })));
 }
+
+function comparableText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function parseJsonLike(value) {
+  const text = String(value || '').trim();
+  if (!/^[\[{]/.test(text)) return null;
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+function isSubsetValue(a, b) {
+  if (Object.is(a, b)) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.every((item) => b.some((cand) => isSubsetValue(item, cand)));
+  }
+  if (a && b && typeof a === 'object' && typeof b === 'object' && !Array.isArray(a) && !Array.isArray(b)) {
+    return Object.entries(a).every(([key, value]) => key in b && isSubsetValue(value, b[key]));
+  }
+  return false;
+}
+
+function memoryCanSupersede(oldItem, newItem) {
+  if (!oldItem || !newItem) return false;
+  if (!memoryIsActive(oldItem) || !memoryIsActive(newItem)) return false;
+  const oldJson = parseJsonLike(memoryContent(oldItem));
+  const newJson = parseJsonLike(memoryContent(newItem));
+  if (oldJson && newJson && isSubsetValue(oldJson, newJson)) return true;
+  const oldText = comparableText(memoryContent(oldItem));
+  const newText = comparableText(memoryContent(newItem));
+  return oldText && newText && oldText !== newText && newText.includes(oldText);
+}
+
+function withSuperseded(item, supersededBy, reason = '被更新记忆取代') {
+  return {
+    ...item,
+    status: item.status === 'quarantined' ? item.status : 'superseded',
+    supersededBy,
+    conflictReason: item.conflictReason || reason,
+    updatedAt: item.updatedAt || nowIso(),
+  };
+}
+
+function withConflict(item, conflictWith, reason = '同 key 存在多个不同值') {
+  return {
+    ...item,
+    status: item.status === 'quarantined' ? item.status : 'conflicted',
+    conflictWith: [...new Set([...(Array.isArray(item.conflictWith) ? item.conflictWith : []), ...conflictWith].filter(Boolean))],
+    conflictReason: item.conflictReason || reason,
+    updatedAt: item.updatedAt || nowIso(),
+  };
+}
+
 function mergeMemories(existing, incoming) {
-  const byKey = new Map();
+  const groups = new Map();
   for (const item of [...(existing || []), ...(incoming || [])]) {
     const itemKey = String(item.key || '').trim();
     const content = stripKeyPrefix(memoryContent(item), itemKey);
@@ -208,18 +264,46 @@ function mergeMemories(existing, incoming) {
     const mergeKey = itemKey
       ? `${item.scope || ''}|${itemKey.toLowerCase()}`
       : `${item.scope || ''}|${type}|${content.toLowerCase()}`;
-    const prev = byKey.get(mergeKey);
-    if (prev && item.source === 'legacy' && prev.source !== 'legacy') {
-      continue;
+    const normalized = { ...item, key: itemKey, type, content };
+    const bucket = groups.get(mergeKey) || [];
+    const sameContent = bucket.find((prev) => comparableText(memoryContent(prev)) === comparableText(content));
+    if (sameContent) {
+      const merged = timeMs(normalized.updatedAt) >= timeMs(sameContent.updatedAt)
+        ? { ...sameContent, ...normalized }
+        : { ...normalized, ...sameContent };
+      merged.useCount = Math.max(Number(sameContent.useCount) || 0, Number(normalized.useCount) || 0);
+      merged.lastUsedAt = normalized.lastUsedAt || sameContent.lastUsedAt || '';
+      bucket.splice(bucket.indexOf(sameContent), 1, merged);
+    } else {
+      bucket.push(normalized);
     }
-    if (prev && memoryIsActive(prev) && !memoryIsActive(item)) {
-      continue;
-    }
-    if (!prev || prev.source === 'legacy' || timeMs(item.updatedAt) >= timeMs(prev.updatedAt)) {
-      byKey.set(mergeKey, { ...prev, ...item, key: itemKey, type, content });
-    }
+    groups.set(mergeKey, bucket);
   }
-  return [...byKey.values()];
+
+  const out = [];
+  for (const bucket of groups.values()) {
+    const nonLegacy = bucket.filter((item) => item.source !== 'legacy');
+    let items = nonLegacy.length ? [
+      ...nonLegacy,
+      ...bucket.filter((item) => item.source === 'legacy').map((item) => withSuperseded(item, nonLegacy[0]?.id || '', '旧 facts 已被结构化 memory 取代')),
+    ] : bucket;
+    const active = items.filter(memoryIsActive);
+    if (active.length > 1) {
+      const sorted = [...active].sort((a, b) => timeMs(b.updatedAt) - timeMs(a.updatedAt));
+      const latest = sorted[0];
+      const canSupersedeAll = sorted.slice(1).every((item) => memoryCanSupersede(item, latest));
+      if (canSupersedeAll) {
+        items = items.map((item) => item === latest || !memoryIsActive(item) ? item : withSuperseded(item, latest.id, '新记忆包含旧记忆内容'));
+      } else {
+        const activeIds = active.map((item) => item.id).filter(Boolean);
+        items = items.map((item) => memoryIsActive(item)
+          ? withConflict(item, activeIds.filter((id) => id !== item.id))
+          : item);
+      }
+    }
+    out.push(...items);
+  }
+  return out;
 }
 function pruneMemories(items) {
   const now = Date.now();
@@ -352,6 +436,9 @@ function normalizeGraphEdges(rawEdges, { scope = 'session', origin = 'llm', prov
       origin: raw.origin || raw.memorySource || origin,
       status: raw.status || policy.status,
       policyReason: raw.policyReason || policy.policyReason,
+      conflictWith: Array.isArray(raw.conflictWith) ? raw.conflictWith : [],
+      conflictReason: raw.conflictReason || '',
+      supersededBy: raw.supersededBy || '',
       sourceSessionId: raw.sourceSessionId || provenance.sourceSessionId || '',
       sourceMessageIds: Array.isArray(raw.sourceMessageIds) ? raw.sourceMessageIds : provenance.sourceMessageIds || [],
       sourceTextHash: raw.sourceTextHash || provenance.sourceTextHash || '',
@@ -385,7 +472,46 @@ function mergeGraphEdges(existing, incoming) {
       });
     }
   }
-  return [...byKey.values()];
+  return applyGraphConflicts([...byKey.values()]);
+}
+function graphConflictGroupKey(edge) {
+  return [
+    edge.scope || '',
+    graphEntityKey(edge.subject),
+    String(edge.predicate || '').toLowerCase(),
+  ].join('|');
+}
+function edgeWithConflict(edge, conflictWith, reason = '同 subject/predicate 存在多个不同 object') {
+  return {
+    ...edge,
+    status: edge.status === 'quarantined' ? edge.status : 'conflicted',
+    conflictWith: [...new Set([...(Array.isArray(edge.conflictWith) ? edge.conflictWith : []), ...conflictWith].filter(Boolean))],
+    conflictReason: edge.conflictReason || reason,
+    updatedAt: edge.updatedAt || nowIso(),
+  };
+}
+function applyGraphConflicts(edges) {
+  const groups = new Map();
+  for (const edge of edges || []) {
+    if (!graphEdgeIsActive(edge) || isAliasPredicate(edge.predicate)) continue;
+    const key = graphConflictGroupKey(edge);
+    const bucket = groups.get(key) || [];
+    bucket.push(edge);
+    groups.set(key, bucket);
+  }
+  const conflictedIds = new Map();
+  for (const bucket of groups.values()) {
+    const objects = new Set(bucket.map((edge) => graphEntityKey(edge.object)).filter(Boolean));
+    if (objects.size <= 1) continue;
+    const ids = bucket.map((edge) => edge.id).filter(Boolean);
+    for (const edge of bucket) {
+      conflictedIds.set(edge.id, ids.filter((id) => id !== edge.id));
+    }
+  }
+  if (conflictedIds.size === 0) return edges;
+  return (edges || []).map((edge) => conflictedIds.has(edge.id)
+    ? edgeWithConflict(edge, conflictedIds.get(edge.id))
+    : edge);
 }
 function graphAliasesFromEdges(edges) {
   const aliases = [];
@@ -460,6 +586,7 @@ function graphToPersist(graph) {
 }
 function graphForPrompt(graph) {
   const edges = pruneGraphEdges(graph?.edges || [])
+    .filter(graphEdgeIsActive)
     .slice(0, 40)
     .map(({ subject, predicate, object, description, confidence }) => ({
       subject,
@@ -1014,3 +1141,10 @@ export function clearSession(key) {
 export function clearGroupSession(chatId) {
   groupStore.delete(String(chatId || 'unknown'));
 }
+
+export const __testing = Object.freeze({
+  mergeMemories,
+  mergeGraphEdges,
+  normalizeMemoryItems,
+  normalizeGraphEdges,
+});

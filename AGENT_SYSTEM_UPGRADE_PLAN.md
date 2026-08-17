@@ -34,7 +34,12 @@
   - LLM 新写入记忆会经过凭证、身份篡改、提示词注入策略过滤
   - 高风险内容进入 `status: "quarantined"`，默认不注入上下文
   - 已通过 `npm run check` 和 `npm test`（66 tests）
-- P1-3 记忆冲突与废弃机制：待开始。
+- P1-3 记忆冲突与废弃机制：已完成基础版。
+  - 同 key 不同值会进入 `status: "conflicted"`，双方保留 `conflictWith/conflictReason` 审计字段
+  - 新 JSON 记忆包含旧 JSON 记忆时，旧记忆进入 `status: "superseded"` 并记录 `supersededBy`
+  - 同 subject/predicate 多 object 的图谱边会进入 `conflicted`，别名边不误判为冲突
+  - `conflicted/superseded/quarantined` 默认不注入上下文，也不会进入维护抽取器的 graph prompt
+  - 已通过 `npm run check` 和 `npm test`（78 tests）
 - P1-5 Hybrid Retrieval：待开始。
 
 ## 当前基线
