@@ -35,6 +35,7 @@ export class ApprovalStore {
     };
     this.pending.set(confirmationKey, pending);
     this.stateStore?.saveApproval?.(confirmationKey, pending);
+    return pending;
   }
 
   resolve(confirmationKey, text, { isOwner = false } = {}) {
@@ -69,6 +70,32 @@ export class ApprovalStore {
     // 用户转而提出新请求时作废旧审批，避免稍后的简短“ok”误触发。
     this.deletePending(confirmationKey);
     return { kind: 'superseded', action };
+  }
+
+  resolveAction(confirmationKey, payload = {}, { isOwner = false } = {}) {
+    const action = this.pending.get(confirmationKey);
+    if (!action) return { kind: 'none' };
+    if (Date.now() - action.at >= this.ttlMs) {
+      this.deletePending(confirmationKey);
+      return { kind: 'expired', action };
+    }
+    if (!isOwner) return { kind: 'unauthorized', action };
+
+    const actionId = String(payload.actionId || '').trim();
+    const confirmToken = String(payload.confirmToken || '').trim();
+    if ((action.id && actionId !== action.id) || (action.confirmToken && confirmToken !== action.confirmToken)) {
+      return { kind: 'mismatch', action };
+    }
+
+    if (payload.decision === 'confirm') {
+      this.deletePending(confirmationKey);
+      return { kind: 'execute', action };
+    }
+    if (payload.decision === 'cancel') {
+      this.deletePending(confirmationKey);
+      return { kind: 'cancel', action };
+    }
+    return { kind: 'mismatch', action };
   }
 
   size() {

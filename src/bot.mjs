@@ -27,6 +27,7 @@ import {
 import { getToolSchemas, getToolMetadata, executeTool, getRecentChatContext, renderMessageContent } from './tools.mjs';
 import { runLark } from './lark.mjs';
 import { ApprovalStore } from './approval.mjs';
+import { buildApprovalCard, buildApprovalStatusCard, parseApprovalActionValue } from './approval-card.mjs';
 import { SessionQueue } from './session-queue.mjs';
 import { RuntimeStateStore } from './state-store.mjs';
 import { formatLarkFailureForUser, formatLarkSuccessForUser } from './lark-errors.mjs';
@@ -36,8 +37,10 @@ import { executeApprovedShellAction, formatShellResultForUser, shellDockerEnable
 
 const LARK_CLI = process.env.LARK_CLI_BIN || 'lark-cli';
 const EVENT_KEY = 'im.message.receive_v1';
+const CARD_ACTION_EVENT_KEY = 'card.action.trigger';
 const IDENTITY = process.env.LARK_IDENTITY || 'bot'; // 回复身份：bot | user
 const RECONNECT_DELAY_MS = 3000;
+const APPROVAL_CARD_ENABLED = (process.env.APPROVAL_CARD_ENABLED || 'on').toLowerCase() !== 'off';
 // 机器人主人（专属服务对象）的 open_id：其消息完全信任；其他人的请求要过安全评估。
 let OWNER_OPEN_ID = getOwnerOpenId();
 let OWNER_NAME = getOwnerName();
@@ -254,6 +257,55 @@ async function replyMessage(messageId, text) {
   return ok;
 }
 
+async function replyApprovalCard(messageId, action) {
+  if (!APPROVAL_CARD_ENABLED || !messageId || !action) return false;
+  const card = buildApprovalCard(action, { ttlMs: CONFIRM_TTL_MS });
+  const r = await runLark([
+    'im', '+messages-reply',
+    '--message-id', messageId,
+    '--msg-type', 'interactive',
+    '--content', JSON.stringify(card),
+    '--as', 'bot',
+  ]);
+  const ok = r.code === 0 && (r.json ? r.json.ok !== false : true);
+  if (ok) console.log(`[reply] ✅ 已回复确认卡片 ${messageId}`);
+  else console.error(`[reply] ❌ 确认卡片发送失败 ${messageId} (code=${r.code}): ${r.err.trim() || r.out.trim()}`);
+  return ok;
+}
+
+async function updateApprovalCard(token, action, { status, detail }) {
+  if (!token) return false;
+  const card = buildApprovalStatusCard(action || {}, { status, detail });
+  const r = await runLark([
+    'api', 'POST', '/open-apis/interactive/v1/card/update',
+    '--as', 'bot',
+    '--data', JSON.stringify({ token, card }),
+  ]);
+  const ok = r.code === 0 && (r.json ? r.json.ok !== false : true);
+  if (!ok) console.error(`[card] ❌ 更新确认卡片失败 (code=${r.code}): ${r.err.trim() || r.out.trim()}`);
+  return ok;
+}
+
+async function executePendingApproval(pending) {
+  console.log(`[confirm] 执行 action=${pending.id?.slice(0, 8) || 'legacy'} tool=${pending.toolName || 'unknown'}`);
+  if (pending.executor === 'shell') {
+    const r = await executeApprovedShellAction(pending.shell);
+    return formatShellResultForUser(pending, r);
+  }
+  const r = await runLark(pending.args);
+  if (r.code !== 0 || r.json?.ok === false) return formatLarkFailureForUser(r);
+  return formatLarkSuccessForUser(pending, r);
+}
+
+async function replyAgentResponse(messageId, response) {
+  const text = typeof response === 'string' ? response : String(response?.text || '');
+  if (response?.approvalAction) {
+    const cardSent = await replyApprovalCard(messageId, response.approvalAction);
+    if (cardSent) return true;
+  }
+  return replyMessage(messageId, text);
+}
+
 // 统一的「问答（含写操作二次确认）」处理：
 //  - 主人若回复「确认 <确认码>」且有待执行的写命令 → 执行它
 //  - 主人若回复「取消」→ 放弃
@@ -261,36 +313,35 @@ async function replyMessage(messageId, text) {
 async function runAgentWithConfirm(text, ctx, confirmationKey, isOwner) {
   const decision = approvals.resolve(confirmationKey, text, { isOwner });
   if (decision.kind === 'execute') {
-    const pending = decision.action;
-    console.log(`[confirm] 执行 action=${pending.id?.slice(0, 8) || 'legacy'} tool=${pending.toolName || 'unknown'}`);
-    if (pending.executor === 'shell') {
-      const r = await executeApprovedShellAction(pending.shell);
-      return formatShellResultForUser(pending, r);
-    }
-    const r = await runLark(pending.args);
-    if (r.code !== 0 || r.json?.ok === false) return formatLarkFailureForUser(r);
-    return formatLarkSuccessForUser(pending, r);
+    return { text: await executePendingApproval(decision.action) };
   }
   if (decision.kind === 'cancel') {
-    return '好的，已取消该操作。';
+    return { text: '好的，已取消该操作。' };
   }
   if (decision.kind === 'expired') {
-    return '这条待确认操作已经过期，未执行。请重新发起操作。';
+    return { text: '这条待确认操作已经过期，未执行。请重新发起操作。' };
   }
   if (decision.kind === 'mismatch') {
     const token = decision.action?.confirmToken;
-    return token
+    return { text: token
       ? `确认码不匹配，未执行。请回复「确认 ${token}」执行，或「取消」放弃。`
-      : '确认内容不匹配，未执行。';
+      : '确认内容不匹配，未执行。' };
   }
 
   // 正常 Agent 处理；注入 registerPendingWrite 让写操作可登记待确认
+  let registeredAction = null;
   const agentCtx = {
     ...ctx,
     confirmedWrite: false,
-      registerPendingWrite: (action) => approvals.register(action?.confirmationKey || confirmationKey, action),
+      registerPendingWrite: (action) => {
+        registeredAction = approvals.register(action?.confirmationKey || confirmationKey, action);
+      },
   };
-  return runAgent(text, agentCtx, { getToolSchemas, getToolMetadata, executeTool });
+  const answer = await runAgent(text, agentCtx, { getToolSchemas, getToolMetadata, executeTool });
+  return {
+    text: answer,
+    approvalAction: registeredAction && answer === registeredAction.preview ? registeredAction : null,
+  };
 }
 
 // 处理单条消息事件
@@ -388,7 +439,7 @@ async function handleEvent(evt) {
       if (recent.error) console.warn(`[context] 群聊上下文预取失败 ${messageId}: ${recent.error}`);
       else threadContext = recent.text || '';
     }
-    const answer = await runAgentWithConfirm(qText, {
+    const response = await runAgentWithConfirm(qText, {
       isOwner,
       senderId,
       senderName,
@@ -400,7 +451,8 @@ async function handleEvent(evt) {
       ...sharedGroupCtx,
       threadContext,
     }, gKey.id, isOwner);
-    const sent = await replyMessage(messageId, answer);
+    const answer = response.text;
+    const sent = await replyAgentResponse(messageId, response);
     if (!sent) {
       forgetHandled(messageId);
       return;
@@ -435,7 +487,7 @@ async function handleEvent(evt) {
   // 统一交给 Agent 编排（私聊无群上下文，查群成员/群消息类工具会提示不可用；查人等仍可用）
   const pKey = sessionKey({ chatType, chatId: d.chat_id, senderId, senderName, senderDept: senderProfile?.department || '', senderEmail: senderProfile?.email || '' });
   const pCtx = buildContext(pKey, { persist: true, query: renderedRawText }); // 主人与访客均持久化三层记忆
-  const answer = await runAgentWithConfirm(renderedRawText, {
+  const response = await runAgentWithConfirm(renderedRawText, {
       isOwner,
       senderId,
       senderName,
@@ -444,13 +496,55 @@ async function handleEvent(evt) {
       ownerConfirmationKey: OWNER_OPEN_ID ? `p:${OWNER_OPEN_ID}` : '',
       ...pCtx,
   }, pKey.id, isOwner);
-  const sent = await replyMessage(messageId, answer);
+  const answer = response.text;
+  const sent = await replyAgentResponse(messageId, response);
   if (!sent) {
     forgetHandled(messageId);
     return;
   }
   appendTurn(pKey, renderedRawText, answer, { persist: true });
   maintainMemory(pKey).catch((e) => console.error('[memory] 维护异常：', e.message)); // 异步，不阻塞
+}
+
+async function handleCardActionEvent(evt) {
+  const d = evt.data || evt;
+  const eventId = d.event_id || `${d.message_id || 'unknown'}:${d.operator_id || 'unknown'}:${d.timestamp || Date.now()}`;
+  if (alreadyHandled(eventId, {
+    chatId: d.chat_id || '',
+    senderId: d.operator_id || '',
+    eventTime: Number(d.timestamp) || 0,
+  })) return;
+
+  const payload = parseApprovalActionValue(d.action_value);
+  if (!payload) return;
+
+  if (!isOwnerSender(d.operator_id || '')) {
+    console.warn(`[card] 非主人点击确认卡片 operator=${maskId(d.operator_id || '')}`);
+    if (d.message_id) await replyMessage(d.message_id, '只有主人可以确认或取消该操作。');
+    return;
+  }
+
+  const decision = approvals.resolveAction(payload.confirmationKey, payload, { isOwner: true });
+  const action = decision.action || {};
+  let status = 'invalid';
+  let detail = '这条确认已经失效，请重新发起操作。';
+
+  if (decision.kind === 'execute') {
+    detail = await executePendingApproval(action);
+    status = /^执行失败/.test(detail) ? 'failed' : 'success';
+  } else if (decision.kind === 'cancel') {
+    status = 'canceled';
+    detail = '好的，已取消该操作。';
+  } else if (decision.kind === 'expired') {
+    status = 'expired';
+    detail = '这条待确认操作已经过期，未执行。请重新发起操作。';
+  } else if (decision.kind === 'mismatch') {
+    status = 'invalid';
+    detail = '确认内容不匹配，未执行。';
+  }
+
+  const updated = await updateApprovalCard(d.token, action, { status, detail });
+  if (!updated && d.message_id) await replyMessage(d.message_id, detail);
 }
 
 function eventMessageId(evt) {
@@ -487,9 +581,42 @@ function enqueueEvent(evt) {
   return true;
 }
 
+function cardActionEventId(evt) {
+  const d = evt?.data || evt || {};
+  return d.event_id || `${d.message_id || 'unknown'}:${d.operator_id || 'unknown'}:${d.timestamp || ''}`;
+}
+
+function cardActionSessionKey(evt) {
+  const d = evt?.data || evt || {};
+  const payload = parseApprovalActionValue(d.action_value);
+  return payload?.confirmationKey || d.operator_id || cardActionEventId(evt);
+}
+
+const cardActionScheduler = new SessionQueue({
+  maxConcurrent: Math.max(1, Math.min(MAX_CONCURRENT, 3)),
+  maxQueued: EVENT_QUEUE_MAX,
+  getKey: cardActionSessionKey,
+  onError: (e, evt) => {
+    const id = cardActionEventId(evt);
+    if (id) forgetHandled(id);
+    console.error('[card] 未捕获异常：', e);
+  },
+});
+
+function enqueueCardActionEvent(evt) {
+  if (!cardActionScheduler.enqueue(evt, handleCardActionEvent)) {
+    console.error(`[queue] 卡片事件队列已满(${EVENT_QUEUE_MAX})，拒绝接收新事件`);
+    return false;
+  }
+  return true;
+}
+
 let consumerChild = null;
 let consumerRl = null;
 let reconnectTimer = null;
+let cardConsumerChild = null;
+let cardConsumerRl = null;
+let cardReconnectTimer = null;
 let shuttingDown = false;
 
 function scheduleReconnect(reason) {
@@ -498,6 +625,15 @@ function scheduleReconnect(reason) {
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     startConsumer();
+  }, RECONNECT_DELAY_MS);
+}
+
+function scheduleCardReconnect(reason) {
+  if (shuttingDown || cardReconnectTimer || !APPROVAL_CARD_ENABLED) return;
+  console.error(`[card] 事件流断开（${reason}），${RECONNECT_DELAY_MS / 1000}s 后重连…`);
+  cardReconnectTimer = setTimeout(() => {
+    cardReconnectTimer = null;
+    startCardActionConsumer();
   }, RECONNECT_DELAY_MS);
 }
 
@@ -541,15 +677,59 @@ function startConsumer() {
   });
 }
 
+function startCardActionConsumer() {
+  if (!APPROVAL_CARD_ENABLED || shuttingDown || cardConsumerChild) return;
+  console.log(`[card] 启动事件消费：${CARD_ACTION_EVENT_KEY}（identity=bot）`);
+  const child = spawn(
+    LARK_CLI,
+    ['event', 'consume', CARD_ACTION_EVENT_KEY, '--as', 'bot'],
+    { stdio: ['pipe', 'pipe', 'inherit'] }
+  );
+  cardConsumerChild = child;
+  if (child.stdin) child.stdin.on('error', () => {});
+
+  const rl = readline.createInterface({ input: child.stdout });
+  cardConsumerRl = rl;
+  rl.on('line', (line) => {
+    const s = line.trim();
+    if (!s || s[0] !== '{') return;
+    let evt;
+    try { evt = JSON.parse(s); } catch { return; }
+    enqueueCardActionEvent(evt);
+  });
+
+  let ended = false;
+  const onEnded = (reason) => {
+    if (ended) return;
+    ended = true;
+    if (cardConsumerChild === child) cardConsumerChild = null;
+    if (cardConsumerRl === rl) cardConsumerRl = null;
+    try { rl.close(); } catch { /* ignore */ }
+    scheduleCardReconnect(reason);
+  };
+  child.on('close', (code) => onEnded(`code=${code}`));
+  child.on('error', (e) => {
+    console.error(`[card] 无法启动 ${LARK_CLI}: ${e.message}`);
+    onEnded(e.message);
+  });
+}
+
 function stopConsumer() {
   shuttingDown = true;
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (cardReconnectTimer) clearTimeout(cardReconnectTimer);
   reconnectTimer = null;
+  cardReconnectTimer = null;
   try { consumerRl?.close(); } catch { /* ignore */ }
   try { consumerChild?.kill('SIGTERM'); } catch { /* ignore */ }
+  try { cardConsumerRl?.close(); } catch { /* ignore */ }
+  try { cardConsumerChild?.kill('SIGTERM'); } catch { /* ignore */ }
   consumerRl = null;
   consumerChild = null;
+  cardConsumerRl = null;
+  cardConsumerChild = null;
   eventScheduler.clear();
+  cardActionScheduler.clear();
 }
 
 let shutdownStarted = false;
@@ -559,7 +739,7 @@ async function shutdown(signal) {
   console.log(`\n[bot] 收到 ${signal}，正在优雅退出…`);
   stopConsumer();
   const deadline = Date.now() + 5000;
-  while (eventScheduler.inFlight > 0 && Date.now() < deadline) {
+  while ((eventScheduler.inFlight > 0 || cardActionScheduler.inFlight > 0) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   await flushMemory();
@@ -578,9 +758,10 @@ if (!OWNER_OPEN_ID) console.warn('[bot] ⚠️ 未配置 OWNER_OPEN_ID，且自�
 console.log(`能力：Agent 工具编排（读最新版 lark-cli skills 文档自主调用 lark-cli：查人/群成员/消息/总结/日历/文档/任务…）`);
 console.log(`受限 Shell：${shellEnabled() ? `已启用 / runner=${shellDockerEnabled() ? 'docker' : 'local'}` : '未启用'}（默认关闭，仅主人可用）`);
 console.log(`群聊策略：仅 @机器人 时响应${IGNORE_BACKLOG ? '；忽略启动前的历史/积压消息' : ''}`);
-console.log(`安全策略：访客经安全评估(硬闸+防注入+fail-closed)；写操作仅主人且需回复带确认码的「确认 ABC123」；限流 ${RATE_MAX_PER_SENDER}次/${RATE_WINDOW_MS / 1000}s/人，并发上限 ${MAX_CONCURRENT}`);
+console.log(`安全策略：访客经安全评估(硬闸+防注入+fail-closed)；写操作仅主人且需卡片按钮或回复带确认码的「确认 ABC123」；限流 ${RATE_MAX_PER_SENDER}次/${RATE_WINDOW_MS / 1000}s/人，并发上限 ${MAX_CONCURRENT}`);
 console.log(`对话记忆：短期滑动窗口(内存) + 长期摘要 + 关键JSON(按用户落盘 data/memory)；主人与访客均享完整三层`);
 console.log('私聊：收到即回。Ctrl+C 退出。');
 console.log('====================================================');
 await discoverBotIdentity();
 startConsumer();
+startCardActionConsumer();
