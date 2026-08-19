@@ -13,6 +13,7 @@ const DOCKER_WORKSPACE = '/workspace';
 const PYTHON_SANDBOX_WORKDIR = '/tmp';
 
 const READ_COMMANDS = new Set(['pwd', 'ls', 'find', 'rg', 'grep', 'cat', 'head', 'tail', 'wc', 'git']);
+const NETWORK_DIAGNOSTIC_COMMANDS = new Set(['ping']);
 const PYTHON_COMMANDS = new Set(['python', 'python3']);
 const APT_DOWNLOAD_COMMANDS = new Set(['apt', 'apt-get']);
 const URL_DOWNLOAD_COMMANDS = new Set(['curl', 'wget']);
@@ -23,11 +24,28 @@ const FORBIDDEN_COMMANDS = new Set([
   'docker', 'kubectl', 'terraform', 'ansible',
   'node', 'perl', 'ruby', 'php',
 ]);
+const HIGH_RISK_DOCKER_COMMANDS = new Set([
+  'rm', 'rmdir', 'unlink', 'shred',
+  'mv', 'cp', 'dd', 'truncate', 'tee',
+  'chmod', 'chown', 'chgrp',
+  'mkdir', 'touch', 'install',
+  'mkfs', 'mount', 'umount',
+  'kill', 'pkill',
+  'osascript',
+  'sudo', 'su',
+  'docker', 'kubectl', 'terraform', 'ansible',
+  'ssh', 'scp', 'sftp', 'rsync',
+  'nc', 'netcat', 'telnet',
+]);
 const GIT_READ_SUBCOMMANDS = new Set(['status', 'diff', 'show', 'log', 'branch', 'rev-parse', 'ls-files', 'grep']);
 const NPM_ALLOWED = new Set(['test']);
 const NPM_RUN_ALLOWED = new Set(['check', 'test']);
 const APT_PACKAGE_RE = /^[a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+)?(?:=[a-zA-Z0-9:~+.-]+)?$/;
 const DOWNLOAD_OUTPUT_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,119}$/;
+const SHELL_META_RE = /[|;&<>`\r\n]/;
+const SANDBOX_LABEL_COMMANDS = new Set(['bash', 'shell', 'cli']);
+const SANDBOX_INTERPRETERS = new Set(['sh', 'bash', 'zsh', 'fish']);
+const SANDBOX_KNOWN_COMMAND_RE = /^(?:sudo\s+)?(?:apt(?:-get)?|python3?|node|npm|git|ls|pwd|cat|find|grep|rg|curl|wget|ping|neofetch)\b/i;
 const CURL_BOOLEAN_FLAGS = new Set([
   '-f', '--fail',
   '-L', '--location',
@@ -408,13 +426,106 @@ function reviewPython(args) {
   return { ok: true, effect: 'write', risk: 'high', reason: 'Docker 内 Python 脚本执行' };
 }
 
+function vetPublicHost(rawHost, { label = '目标主机' } = {}) {
+  const host = String(rawHost || '').trim().toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+  if (!host) return { ok: false, reason: `${label}为空` };
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) {
+    return { ok: false, reason: `${label}不允许是本地或内网主机名` };
+  }
+  if (isIP(host) && isPrivateIp(host)) {
+    return { ok: false, reason: `${label}不允许是内网、本地或云元数据地址` };
+  }
+  if (!isIP(host) && !host.includes('.')) {
+    return { ok: false, reason: `${label}不允许是单标签主机名，避免内网探测` };
+  }
+  if (!isIP(host) && !/^[a-z0-9.-]{1,253}$/.test(host)) {
+    return { ok: false, reason: `${label}格式不正确` };
+  }
+  return { ok: true, host };
+}
+
+function vetPingNumber(raw, { min = 1, max = 10, label = '参数值' } = {}) {
+  if (!/^\d{1,3}$/.test(String(raw || ''))) return { ok: false, reason: `${label} 必须是整数` };
+  const value = Number(raw);
+  if (value < min || value > max) return { ok: false, reason: `${label} 超出允许范围` };
+  return { ok: true, value };
+}
+
+function reviewPing(args = []) {
+  const out = [];
+  let host = '';
+  let hasCount = false;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = String(args[i] || '');
+    if (arg === '-4' || arg === '-6') {
+      out.push(arg);
+      continue;
+    }
+    if (arg === '-c' || arg === '-W' || arg === '-w') {
+      const value = args[i + 1] || '';
+      const checked = vetPingNumber(value, { max: arg === '-c' ? 5 : 10, label: arg });
+      if (!checked.ok) return checked;
+      if (arg === '-c') hasCount = true;
+      out.push(arg, String(checked.value));
+      i += 1;
+      continue;
+    }
+    const compact = arg.match(/^(-[cWw])(\d{1,3})$/);
+    if (compact) {
+      const checked = vetPingNumber(compact[2], { max: compact[1] === '-c' ? 5 : 10, label: compact[1] });
+      if (!checked.ok) return checked;
+      if (compact[1] === '-c') hasCount = true;
+      out.push(compact[1], String(checked.value));
+      continue;
+    }
+    if (arg.startsWith('-')) return { ok: false, reason: `ping 参数不在 allowlist 内：${arg}` };
+    if (host) return { ok: false, reason: 'ping 单次只允许一个目标主机' };
+    const checkedHost = vetPublicHost(arg, { label: 'ping 目标' });
+    if (!checkedHost.ok) return checkedHost;
+    host = checkedHost.host;
+  }
+  if (!host) return { ok: false, reason: 'ping 缺少目标主机' };
+  const finalArgs = hasCount ? out : ['-c', '4', ...out];
+  finalArgs.push(host);
+  return {
+    ok: true,
+    args: finalArgs,
+    effect: 'read',
+    risk: 'medium',
+    reason: 'Docker 内受限 ping：仅允许公网目标，自动限制包数量，不挂载 workspace',
+    docker: { network: 'bridge', mountWorkspace: false, workdir: '/tmp', dropCaps: false, user: dockerSandboxRootUser() },
+    forceConfirmation: true,
+  };
+}
+
+function reviewGenericDockerCommand(command, args = []) {
+  const lower = String(command || '').toLowerCase();
+  if (!shellDockerEnabled()) return { ok: false, reason: `${command} 不在本机 Shell 命令 allowlist 内；只有 Docker 沙箱开启后才可进入通用命令确认链路` };
+  if (HIGH_RISK_DOCKER_COMMANDS.has(lower)) {
+    return { ok: false, reason: `${command} 属于高风险删除、写入、提权或横向连接命令，即使在 Docker 沙箱中也不自动放行` };
+  }
+  if (SANDBOX_INTERPRETERS.has(lower)) {
+    return { ok: false, reason: '不接受直接执行 shell 解释器；请给出单个结构化命令' };
+  }
+  return {
+    ok: true,
+    effect: 'write',
+    risk: 'medium',
+    reason: 'Docker 内通用命令：不挂载 workspace，需主人确认后执行',
+    docker: { network: 'none', mountWorkspace: false, workdir: '/tmp' },
+    forceConfirmation: true,
+    args,
+  };
+}
+
 function reviewCommandProfile(command, args) {
   if (APT_DOWNLOAD_COMMANDS.has(command)) return reviewAptDownload(args);
   if (URL_DOWNLOAD_COMMANDS.has(command)) return reviewUrlDownload(command, args);
+  if (NETWORK_DIAGNOSTIC_COMMANDS.has(command)) return reviewPing(args);
   if (PYTHON_COMMANDS.has(command)) return reviewPython(args);
-  if (FORBIDDEN_COMMANDS.has(command)) return { ok: false, reason: `${command} 属于禁用命令` };
+  if (FORBIDDEN_COMMANDS.has(command) && !shellDockerEnabled()) return { ok: false, reason: `${command} 属于禁用命令` };
   if (command === 'npm') return reviewNpm(args);
-  if (!READ_COMMANDS.has(command)) return { ok: false, reason: `${command} 不在 Shell 命令 allowlist 内` };
+  if (!READ_COMMANDS.has(command)) return reviewGenericDockerCommand(command, args);
   if (command === 'git') return reviewGit(args);
   if (command === 'find') return reviewFind(args);
   if (command === 'rg') return reviewRipgrep(args);
@@ -422,7 +533,8 @@ function reviewCommandProfile(command, args) {
   return { ok: true, effect: 'read', risk: 'low', reason: '只读 allowlist 命令' };
 }
 
-function shellRequiresConfirmation(_profile) {
+function shellRequiresConfirmation(profile = {}) {
+  if (profile.forceConfirmation) return true;
   if (envBool(process.env.SHELL_CONFIRM_ALL, false)) return true;
   // 兜底：只要落到本机 runner，就可能读写 Mac 文件系统，必须由主人确认。
   if (!shellDockerEnabled()) return true;
@@ -453,6 +565,7 @@ export function reviewShellCommand(input = {}) {
 
   const profile = reviewCommandProfile(cmd.command, argv.args);
   if (!profile.ok) return { ok: false, reason: profile.reason, command: cmd.command, args: argv.args };
+  const finalArgs = Array.isArray(profile.args) ? profile.args : argv.args;
 
   const requiresConfirmation = shellRequiresConfirmation(profile);
   const timeoutMs = clamp(process.env.SHELL_TIMEOUT_MS, 1000, 60000, 10000);
@@ -460,14 +573,14 @@ export function reviewShellCommand(input = {}) {
   const purpose = String(input.purpose || '').trim().slice(0, 300);
   const action = {
     command: cmd.command,
-    args: argv.args,
+    args: finalArgs,
     cwd: dir.cwdLabel,
     purpose,
   };
   return {
     ok: true,
     command: cmd.command,
-    args: argv.args,
+    args: finalArgs,
     cwd: dir.cwd,
     cwdLabel: dir.cwdLabel,
     root: dir.root,
@@ -481,7 +594,7 @@ export function reviewShellCommand(input = {}) {
     maxOutputBytes,
     action,
     audit: {
-      command: formatShellCommand(cmd.command, argv.args),
+      command: formatShellCommand(cmd.command, finalArgs),
       effect: profile.effect,
         category: profile.category || 'default',
       risk: profile.risk,
@@ -501,6 +614,249 @@ export function reviewShellCommand(input = {}) {
       workspaceMounted: profile.docker?.mountWorkspace !== false,
     },
     docker: profile.docker || {},
+  };
+}
+
+function candidateCommandText(text = '') {
+  const raw = String(text || '').replace(/<at\s+user_id="[^"]+">[^<]*<\/at>/g, ' ').trim();
+  if (!raw) return '';
+  const apt = raw.match(/\b(?:bash\s+)?(?:sudo\s+)?(?:apt-get|apt)\s+install(?:\s+[A-Za-z0-9+.:=_-]+){1,8}/i);
+  if (apt) return apt[0].trim();
+  const cue = raw.match(/(?:shell|bash|cli|命令|终端|执行|运行|跑一下|跑)(?:\s*[:：]\s*|\s+)([\s\S]{1,300})/i);
+  if (!cue && !SANDBOX_KNOWN_COMMAND_RE.test(raw)) return '';
+  const source = (cue?.[1] || raw).split(/[。；，、]/)[0].trim();
+  if (cue && SHELL_META_RE.test(source)) return source;
+  const match = source.match(/\b(?:sudo\s+)?[A-Za-z0-9._+-]+(?:\s+(?:"[^"]*"|'[^']*'|[A-Za-z0-9_./:=@%+,-]+)){0,20}/);
+  return (match?.[0] || '').trim();
+}
+
+function splitCommandWords(raw = '') {
+  const text = String(raw || '').trim();
+  const out = [];
+  let cur = '';
+  let quote = '';
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === quote) quote = '';
+      else cur += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (cur) {
+        out.push(cur);
+        cur = '';
+      }
+      continue;
+    }
+    cur += ch;
+  }
+  if (quote) return { ok: false, reason: '命令引号不配对' };
+  if (cur) out.push(cur);
+  return { ok: true, words: out };
+}
+
+export function parseSandboxCommandRequest(text = '') {
+  const rawCommand = candidateCommandText(text);
+  if (!rawCommand) return { ok: false, kind: 'none', reason: '未识别到可执行命令' };
+  if (SHELL_META_RE.test(rawCommand)) {
+    return { ok: false, kind: 'unsupported', rawCommand, reason: '命令包含管道、重定向或多命令连接符，不能进入自动审批链路' };
+  }
+  const split = splitCommandWords(rawCommand);
+  if (!split.ok) return { ok: false, kind: 'unsupported', rawCommand, reason: split.reason };
+  let words = split.words;
+  while (words.length > 1 && SANDBOX_LABEL_COMMANDS.has(String(words[0]).toLowerCase())) words = words.slice(1);
+  let usedSudo = false;
+  if (String(words[0] || '').toLowerCase() === 'sudo') {
+    usedSudo = true;
+    words = words.slice(1);
+  }
+  const command = String(words[0] || '').trim();
+  const args = words.slice(1);
+  if (!command) return { ok: false, kind: 'none', reason: '命令为空' };
+  return {
+    ok: true,
+    rawCommand,
+    command,
+    args,
+    usedSudo,
+    displayCommand: formatShellCommand(command, args),
+  };
+}
+
+function reviewSandboxAptInstall(input) {
+  const args = Array.isArray(input.args) ? input.args.map((item) => String(item)) : [];
+  const sub = String(args[0] || '').toLowerCase();
+  if (sub !== 'install') return null;
+  const packages = args.slice(1).filter((arg) => !['-y', '--yes', '--no-install-recommends'].includes(arg));
+  if (packages.length === 0) return { ok: false, reason: 'apt install 缺少包名' };
+  if (packages.length > 5) return { ok: false, reason: 'apt install 单次最多允许 5 个包' };
+  const bad = packages.find((pkg) => pkg.startsWith('-') || !APT_PACKAGE_RE.test(pkg));
+  if (bad) return { ok: false, reason: `apt 包名不在安全格式 allowlist 内：${bad}` };
+  const installCommand = `apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${packages.join(' ')}`;
+  return {
+    ok: true,
+    sandboxMode: 'apt_install',
+    packages,
+    execCommand: 'sh',
+    execArgs: ['-lc', installCommand],
+    displayCommand: `apt-get install -y --no-install-recommends ${packages.join(' ')}`,
+    effect: 'write',
+    risk: 'high',
+    network: 'bridge',
+    user: dockerSandboxRootUser(),
+    readOnlyRootfs: false,
+    dropCaps: false,
+    reason: '将在临时 Docker 容器内更新 apt 索引并安装包；不挂载 workspace，不触碰宿主机文件系统',
+  };
+}
+
+export function reviewSandboxCommandRequest(input = {}) {
+  const parsed = input.command
+    ? {
+      ok: true,
+      rawCommand: input.rawCommand || formatShellCommand(input.command, input.args || []),
+      command: input.command,
+      args: Array.isArray(input.args) ? input.args : [],
+      displayCommand: input.displayCommand || formatShellCommand(input.command, input.args || []),
+      usedSudo: Boolean(input.usedSudo),
+    }
+    : parseSandboxCommandRequest(input.text || input.rawCommand || '');
+  if (!parsed.ok) return parsed;
+  if (!shellEnabled()) return { ok: false, kind: 'unsupported', rawCommand: parsed.rawCommand, reason: 'Shell 工具未启用。请设置 SHELL_ENABLED=on 后重启机器人。' };
+  if (!shellDockerEnabled()) return { ok: false, kind: 'unsupported', rawCommand: parsed.rawCommand, reason: '访客命令审批只允许 Docker 沙箱执行。请设置 SHELL_DOCKER_ENABLED=on。' };
+  const command = String(parsed.command || '').trim();
+  const normalizedCommand = normalizeCommand(command);
+  if (!normalizedCommand.ok) return { ok: false, kind: 'unsupported', rawCommand: parsed.rawCommand, reason: normalizedCommand.reason };
+  const lower = normalizedCommand.command.toLowerCase();
+  if (SANDBOX_INTERPRETERS.has(lower)) {
+    return { ok: false, kind: 'unsupported', rawCommand: parsed.rawCommand, reason: '不接受直接执行 shell 解释器；请给出单个结构化命令' };
+  }
+  if (lower === 'sudo' || lower === 'su') {
+    return { ok: false, kind: 'unsupported', rawCommand: parsed.rawCommand, reason: 'sudo/su 不会被直接执行；需要解析出后面的实际命令' };
+  }
+
+  if (lower === 'apt' || lower === 'apt-get') {
+    const apt = reviewSandboxAptInstall(parsed);
+    if (!apt) return { ok: false, kind: 'unsupported', rawCommand: parsed.rawCommand, reason: 'apt 仅支持经主人确认后的 install 场景' };
+    if (!apt.ok) return { ...apt, kind: 'unsupported', rawCommand: parsed.rawCommand };
+    const action = {
+      sandboxMode: 'apt_install',
+      command: 'apt-get',
+      args: ['install', ...apt.packages],
+      rawCommand: parsed.rawCommand,
+      displayCommand: apt.displayCommand,
+      packages: apt.packages,
+      purpose: String(input.purpose || '').slice(0, 300),
+    };
+    return {
+      ...apt,
+      command: lower,
+      args: parsed.args,
+      rawCommand: parsed.rawCommand,
+      usedSudo: parsed.usedSudo,
+      action,
+      audit: {
+        command: apt.displayCommand,
+        originalCommand: parsed.rawCommand,
+        runner: 'docker',
+        dockerImage: dockerImage(),
+        dockerNetwork: apt.network,
+        workspaceMounted: false,
+        risk: apt.risk,
+        effect: apt.effect,
+        reason: apt.reason,
+      },
+    };
+  }
+
+  const argv = normalizeArgs(parsed.args, { maxArgLength: 1000 });
+  if (!argv.ok) return { ok: false, kind: 'unsupported', rawCommand: parsed.rawCommand, reason: argv.reason };
+  if (NETWORK_DIAGNOSTIC_COMMANDS.has(lower)) {
+    const ping = reviewPing(argv.args);
+    if (!ping.ok) return { ...ping, kind: 'unsupported', rawCommand: parsed.rawCommand };
+    const action = {
+      sandboxMode: 'simple',
+      command: normalizedCommand.command,
+      args: ping.args,
+      rawCommand: parsed.rawCommand,
+      displayCommand: formatShellCommand(normalizedCommand.command, ping.args),
+      purpose: String(input.purpose || '').slice(0, 300),
+    };
+    return {
+      ok: true,
+      sandboxMode: 'simple',
+      command: normalizedCommand.command,
+      args: ping.args,
+      rawCommand: parsed.rawCommand,
+      displayCommand: action.displayCommand,
+      usedSudo: parsed.usedSudo,
+      execCommand: normalizedCommand.command,
+      execArgs: ping.args,
+      effect: ping.effect,
+      risk: ping.risk,
+      network: ping.docker.network,
+      user: ping.docker.user,
+      readOnlyRootfs: true,
+      dropCaps: ping.docker.dropCaps,
+      reason: ping.reason,
+      action,
+      audit: {
+        command: action.displayCommand,
+        originalCommand: parsed.rawCommand,
+        runner: 'docker',
+        dockerImage: dockerImage(),
+        dockerNetwork: ping.docker.network,
+        workspaceMounted: false,
+        risk: ping.risk,
+        effect: ping.effect,
+        reason: ping.reason,
+      },
+    };
+  }
+  const generic = reviewGenericDockerCommand(normalizedCommand.command, argv.args);
+  if (!generic.ok) return { ...generic, kind: 'unsupported', rawCommand: parsed.rawCommand };
+  const action = {
+    sandboxMode: 'simple',
+    command: normalizedCommand.command,
+    args: generic.args || argv.args,
+    rawCommand: parsed.rawCommand,
+    displayCommand: formatShellCommand(normalizedCommand.command, generic.args || argv.args),
+    purpose: String(input.purpose || '').slice(0, 300),
+  };
+  return {
+    ok: true,
+    sandboxMode: 'simple',
+    command: normalizedCommand.command,
+    args: generic.args || argv.args,
+    rawCommand: parsed.rawCommand,
+    displayCommand: action.displayCommand,
+    usedSudo: parsed.usedSudo,
+    execCommand: normalizedCommand.command,
+    execArgs: generic.args || argv.args,
+    effect: generic.effect,
+    risk: generic.risk,
+    network: generic.docker.network,
+    user: generic.docker.user || dockerUser(),
+    readOnlyRootfs: true,
+    dropCaps: generic.docker.dropCaps,
+    reason: generic.reason,
+    action,
+    audit: {
+      command: action.displayCommand,
+      originalCommand: parsed.rawCommand,
+      runner: 'docker',
+      dockerImage: dockerImage(),
+      dockerNetwork: generic.docker.network,
+      workspaceMounted: false,
+      risk: generic.risk,
+      effect: generic.effect,
+      reason: generic.reason,
+    },
   };
 }
 
@@ -571,6 +927,11 @@ function dockerUser() {
   return /^\d+(?::\d+)?$/.test(value) ? value : '1000:1000';
 }
 
+function dockerSandboxRootUser() {
+  const value = String(process.env.SHELL_DOCKER_ROOT_USER || '0:0').trim();
+  return /^\d+(?::\d+)?$/.test(value) ? value : '0:0';
+}
+
 function containerCwd(review) {
   if (review.docker?.workdir) return review.docker.workdir;
   return review.cwdLabel === '.' ? DOCKER_WORKSPACE : `${DOCKER_WORKSPACE}/${review.cwdLabel.replace(/\\/g, '/')}`;
@@ -620,16 +981,40 @@ export function buildDockerRunArgs(review) {
     '--cpus', dockerCpus(),
     '--memory', dockerMemory(),
     '--pids-limit', dockerPidsLimit(),
-    '--read-only',
-    '--cap-drop', 'ALL',
     '--security-opt', 'no-new-privileges',
-    '--user', dockerUser(),
+    '--user', review.docker?.user || dockerUser(),
     '--workdir', containerCwd(review),
     '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m,mode=1777',
   ];
+  if (review.docker?.readOnlyRootfs !== false) args.push('--read-only');
+  if (review.docker?.dropCaps !== false) args.push('--cap-drop', 'ALL');
   if (mountWorkspace) args.push('-v', `${review.root}:${DOCKER_WORKSPACE}:${dockerWorkspaceMode()}`);
   for (const [key, value] of dockerEnvPairs()) args.push('--env', `${key}=${value}`);
   args.push(dockerImage(), review.command, ...review.args);
+  return args;
+}
+
+export function buildApprovedSandboxDockerArgs(review) {
+  const args = [
+    'run',
+    '--rm',
+    '--pull', dockerPullPolicy(),
+    '--network', review.network || 'none',
+    '--cpus', dockerCpus(),
+    '--memory', dockerMemory(),
+    '--pids-limit', dockerPidsLimit(),
+    '--security-opt', 'no-new-privileges',
+    '--user', review.user || dockerUser(),
+    '--workdir', review.workdir || '/tmp',
+    '--tmpfs', '/tmp:rw,nosuid,size=128m,mode=1777',
+  ];
+  if (review.dropCaps !== false) args.push('--cap-drop', 'ALL');
+  if (review.readOnlyRootfs !== false) args.push('--read-only');
+  for (const [key, value] of dockerEnvPairs()) args.push('--env', `${key}=${value}`);
+  if (review.env) {
+    for (const [key, value] of Object.entries(review.env)) args.push('--env', `${key}=${value}`);
+  }
+  args.push(dockerImage(), review.execCommand, ...review.execArgs);
   return args;
 }
 
@@ -798,6 +1183,31 @@ async function runReviewedShell(review) {
   return shellDockerEnabled() ? runReviewedDockerShell(review) : runReviewedLocalShell(review);
 }
 
+async function runApprovedSandboxDockerShell(review) {
+  const dockerArgs = buildApprovedSandboxDockerArgs(review);
+  const dockerPrefixEnd = Math.max(0, dockerArgs.length - review.execArgs.length - 2);
+  return runProcessLimited(dockerBin(), dockerArgs, {
+    cwd: shellSandboxRoot(),
+    env: dockerCliEnv(),
+    timeoutMs: clamp(process.env.VISITOR_COMMAND_TIMEOUT_MS || process.env.SHELL_TIMEOUT_MS, 1000, 60000, 15000),
+    maxOutputBytes: clamp(process.env.VISITOR_COMMAND_MAX_OUTPUT_BYTES || process.env.SHELL_MAX_OUTPUT_BYTES, 1024, 200000, 50000),
+    audit: {
+      ...review.audit,
+      runner: 'docker',
+      dockerArgsPreview: dockerArgs.slice(0, dockerPrefixEnd).join(' '),
+    },
+    sandbox: {
+      runner: 'docker-approved',
+      image: dockerImage(),
+      cwd: '/tmp',
+      workspaceMounted: false,
+      network: review.network || 'none',
+      rootfs: review.readOnlyRootfs === false ? 'ephemeral-rw' : 'read-only',
+    },
+    displayName: 'Approved Docker Shell',
+  });
+}
+
 function normalizePythonCode(code) {
   const text = String(code || '');
   const maxChars = clamp(process.env.PYTHON_CODE_MAX_CHARS, 100, 50000, 8000);
@@ -873,6 +1283,21 @@ export async function executeApprovedShellAction(shell = {}) {
   return runReviewedShell(review);
 }
 
+export async function executeApprovedSandboxShellAction(shell = {}) {
+  const review = reviewSandboxCommandRequest(shell);
+  if (!review.ok) {
+    return {
+      ok: false,
+      code: -1,
+      stdout: '',
+      stderr: `确认后沙箱复审失败：${review.reason}`,
+      audit: review.audit || null,
+      sandbox: { runner: 'docker-approved', workspaceMounted: false, network: 'none' },
+    };
+  }
+  return runApprovedSandboxDockerShell(review);
+}
+
 export function shellApprovalPreview(review) {
   const dockerNetwork = review.docker?.network || 'none';
   const workspace = review.docker?.mountWorkspace === false ? 'none' : dockerWorkspaceMode();
@@ -892,6 +1317,31 @@ export function shellApprovalPreview(review) {
   ].join('\n');
 }
 
+export function sandboxShellApprovalPreview(review, { requester = '访客', ownerAt = '' } = {}) {
+  return [
+    ownerAt ? `${ownerAt} ${requester} 请求执行一个命令，需你确认。` : `${requester} 请求执行一个命令，需主人确认。`,
+    `原始命令：${review.rawCommand || review.displayCommand}`,
+    `实际执行：${review.displayCommand}`,
+    `功能判断：${describeSandboxCommand(review)}`,
+    `风险等级：${review.risk}（${review.reason}）`,
+    `执行环境：Docker ${dockerImage()}，workspace=none，network=${review.network || 'none'}，rootfs=${review.readOnlyRootfs === false ? '临时可写' : '只读'}`,
+    '边界：不挂载项目目录，不读取宿主机文件；输出会脱敏并截断。',
+  ].join('\n');
+}
+
+export function describeSandboxCommand(review = {}) {
+  if (review.sandboxMode === 'apt_install') {
+    return `安装 Debian/Ubuntu 软件包：${(review.packages || []).join(', ')}`;
+  }
+  const command = String(review.command || review.execCommand || '').toLowerCase();
+  if (command === 'neofetch') return '展示容器系统信息。';
+  if (command === 'ls') return '列出容器内当前目录文件。';
+  if (command === 'pwd') return '显示容器内当前工作目录。';
+  if (command === 'python' || command === 'python3') return '在容器内运行 Python 命令。';
+  if (command === 'curl' || command === 'wget') return '网络下载/请求命令；本审批链路默认禁网，通常会失败。';
+  return '执行一个普通命令；如果容器镜像中不存在该命令，会返回 command not found。';
+}
+
 export function formatShellResultForUser(action = {}, result = {}) {
   const shell = action.shell || action;
   const command = formatShellCommand(shell.command || '?', shell.args || []);
@@ -901,6 +1351,23 @@ export function formatShellResultForUser(action = {}, result = {}) {
     `命令：\`${command.replace(/`/g, '\\`')}\``,
     `执行环境：${result.sandbox?.runner === 'docker' ? `Docker（${result.sandbox.image || 'unknown'}）` : '本机受限进程'}`,
     `执行目录：${result.sandbox?.cwd || shell.cwd || '.'}`,
+    `退出码：${result.code}`,
+  ];
+  if (result.truncated) lines.push('输出已达到上限并被截断。');
+  if (result.error && !result.stderr) lines.push(`错误：${result.error}`);
+  if (result.stdout) lines.push('', 'stdout:', '```text', String(result.stdout).slice(0, 5000), '```');
+  if (result.stderr) lines.push('', 'stderr:', '```text', String(result.stderr).slice(0, 3000), '```');
+  return lines.join('\n');
+}
+
+export function formatSandboxShellResultForUser(action = {}, result = {}) {
+  const shell = action.shell || action;
+  const command = shell.displayCommand || shell.rawCommand || formatShellCommand(shell.command || '?', shell.args || []);
+  const lines = [
+    result.ok ? '访客命令已在沙箱中执行。' : '访客命令沙箱执行失败。',
+    '',
+    `命令：\`${String(command).replace(/`/g, '\\`')}\``,
+    `执行环境：Docker（${result.sandbox?.image || 'unknown'}，workspace=none，network=${result.sandbox?.network || 'none'}，rootfs=${result.sandbox?.rootfs || 'unknown'}）`,
     `退出码：${result.code}`,
   ];
   if (result.truncated) lines.push('输出已达到上限并被截断。');

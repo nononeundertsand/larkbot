@@ -23,7 +23,7 @@ export class ApprovalStore {
     const normalized = Array.isArray(action)
       ? { id: '', toolName: 'legacy', executor: 'lark', args: action, preview: '' }
       : { executor: 'lark', ...action };
-    if (normalized.executor === 'shell') {
+    if (normalized.executor === 'shell' || normalized.executor === 'sandbox_shell') {
       if (!normalized.shell?.command) throw new Error('待确认 Shell 操作缺少命令');
     } else if (!Array.isArray(normalized?.args) || normalized.args.length === 0) {
       throw new Error('待确认写操作缺少命令参数');

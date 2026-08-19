@@ -5,6 +5,13 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ApprovalStore } from '../src/approval.mjs';
 import { RuntimeStateStore } from '../src/state-store.mjs';
+import {
+  advanceWorkflow,
+  createWorkflow,
+  requireWorkflowConfirmation,
+  resumeWorkflow,
+  updateWorkflowStep,
+} from '../src/workflow.mjs';
 
 test('写审批绑定具体会话，不能跨群确认', () => {
   const store = new ApprovalStore({ ttlMs: 10000 });
@@ -41,6 +48,28 @@ test('审批状态机支持 Shell executor 动作', () => {
   assert.equal(result.kind, 'execute');
   assert.equal(result.action.executor, 'shell');
   assert.equal(result.action.shell.command, 'ls');
+});
+
+test('审批状态机支持访客沙箱 Shell executor 动作', () => {
+  const store = new ApprovalStore({ ttlMs: 10000 });
+  store.register('g:group:owner', {
+    id: 'v1',
+    toolName: 'visitor_sandbox_command',
+    executor: 'sandbox_shell',
+    shell: {
+      sandboxMode: 'apt_install',
+      command: 'apt-get',
+      args: ['install', 'neofetch'],
+      rawCommand: 'sudo apt install neofetch',
+      displayCommand: 'apt-get install -y --no-install-recommends neofetch',
+    },
+    preview: '访客请求执行命令',
+    confirmToken: 'VIS123',
+  });
+  const result = store.resolve('g:group:owner', '确认 VIS123', { isOwner: true });
+  assert.equal(result.kind, 'execute');
+  assert.equal(result.action.executor, 'sandbox_shell');
+  assert.equal(result.action.shell.sandboxMode, 'apt_install');
 });
 
 test('运行状态持久化：事件幂等可跨实例恢复', () => {
@@ -86,6 +115,45 @@ test('运行状态持久化：待确认审批可跨实例恢复并在确认后�
 
     const afterConfirm = new ApprovalStore({ ttlMs: 10000, stateStore: new RuntimeStateStore({ file }) });
     assert.equal(afterConfirm.resolve('p:owner', '确认 TASK1', { isOwner: true }).kind, 'none');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('运行状态持久化：workflow 可跨实例恢复、暂停确认并继续推进', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'larkbot-state-workflow-'));
+  const file = join(dir, 'state.json');
+  try {
+    const first = new RuntimeStateStore({ file });
+    let workflow = createWorkflow({
+      title: '整理会议并发送报告',
+      sessionKey: 'p:owner',
+      steps: [
+        { id: 'plan', type: 'plan', title: '制定步骤' },
+        { id: 'send', type: 'send', title: '发送报告', requiresConfirmation: true },
+      ],
+    });
+    first.saveWorkflow(workflow);
+
+    const restored = new RuntimeStateStore({ file });
+    workflow = restored.getWorkflow(workflow.workflowId);
+    assert.equal(workflow.title, '整理会议并发送报告');
+    assert.equal(restored.listWorkflows({ sessionKey: 'p:owner' }).length, 1);
+
+    workflow = updateWorkflowStep(workflow, 'plan', { status: 'completed', output: { ok: true } });
+    workflow = advanceWorkflow(workflow);
+    workflow = requireWorkflowConfirmation(workflow, { reason: '发送前需要主人确认', actionId: 'send_report' });
+    restored.saveWorkflow(workflow);
+
+    const waiting = new RuntimeStateStore({ file }).getWorkflow(workflow.workflowId);
+    assert.equal(waiting.status, 'waiting_confirmation');
+    assert.equal(waiting.requiresConfirmation, true);
+    assert.equal(resumeWorkflow(waiting, 'BADTOKEN').ok, false);
+
+    const resumed = resumeWorkflow(waiting, waiting.resumeToken);
+    assert.equal(resumed.ok, true);
+    assert.equal(resumed.workflow.status, 'running');
+    assert.equal(resumed.workflow.requiresConfirmation, false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

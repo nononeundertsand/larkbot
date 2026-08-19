@@ -45,6 +45,28 @@
   - 图谱召回已加入 BM25、alias 扩展、多跳 graph distance 惩罚，降低无关边污染
   - 第一阶段保持零外部依赖，embedding cache 作为后续可选阶段
   - 已通过 `npm run check` 和记忆相关定向测试
+- P2-1 / P2-2 工具 Runtime Schema 与协议 Envelope：已完成基础版。
+  - 新增 `src/tool-schema.mjs`，提供无依赖 JSON Schema 子集校验、结构化错误和工具结果 Envelope
+  - `src/tools.mjs` 的 `executeTool` 已统一在执行前校验参数；默认返回旧格式，`{ envelope: true }` 可返回标准 envelope
+  - 新增 `getToolDescriptors()` 暴露 `name/description/inputSchema/outputSchema/policy/examples`
+  - 已覆盖日期、邮箱、URL 协议、Shell args 等关键边界校验
+  - 已通过 `npm run check` 和 `npm test`（86 tests）
+- P2-3 Durable Workflow：已完成持久化基础版。
+  - 新增 `src/workflow.mjs`，支持 `plan/tool/transform/verify/confirm/send` 节点、暂停确认、resumeToken 恢复和推进
+  - `src/state-store.mjs` 新增 `workflows` 持久区及 `save/get/list/update/delete/prune` 接口
+  - 已验证 workflow 可跨进程实例恢复，等待确认时不会自动继续
+  - 尚未接入 Agent 自动复杂任务规划；普通写工具审计摘要仍待统一改造
+  - 已通过 `npm run check` 和 `npm test`（86 tests）
+- P2-4 执行前审计器：已完成访客命令审批子路径。
+  - 群聊访客命令类请求不再直接落入外层安全拒绝，而是先解析命令、解释功能/风险，再向主人发送确认/取消卡片
+  - 确认后仅通过 `sandbox_shell` executor 在无 workspace 挂载的临时 Docker 沙箱中执行
+  - `sudo apt install <pkg>` 会被规范化为临时容器内 `apt-get update && apt-get install -y --no-install-recommends <pkg>`，复杂 shell 语法、管道、重定向不进入审批链
+  - Docker runner 下通用命令可进入主人确认链路；`ping` 会自动限制次数和公网目标，`rm` 等删除/高风险写入命令仍拒绝
+  - 普通一等写工具的结构化审计摘要仍待统一改造
+- P3-2 体验优化：多条回复基础版已完成。
+  - 新增 `src/reply-parts.mjs`，普通回答可按空行拆成多条飞书回复
+  - 代码块、表格、列表、确认码和命令输出保持单条，避免格式被拆坏
+  - 可通过 `MULTI_REPLY_ENABLED=off` 回退单条回复，`MULTI_REPLY_MAX_PARTS` 控制最多拆分条数
 
 ## 当前基线
 
@@ -64,8 +86,8 @@
 - 事件幂等、审批、工具调用记录等运行状态不持久
 - 缺少对话级 eval，升级后难判断行为是否退化
 - 记忆缺少来源证据、冲突处理、实体消歧和写入治理
-- 工具入参缺少统一 runtime schema 校验
-- 复杂多步骤任务缺少 durable workflow
+- 高风险操作确认前的审计摘要还不够结构化
+- 复杂多步骤任务已有 durable workflow 基础层，但尚未接入 Agent 自动规划与恢复编排
 
 ## 迭代原则
 
@@ -385,6 +407,23 @@ P1 目标是让记忆从“能保存”升级到“可治理、可解释、可�
 
 目标：工具执行前做统一入参校验，减少模型生成异常参数造成的不确定行为。
 
+状态：已完成基础版。
+
+落地情况：
+
+- 新增 `src/tool-schema.mjs`：
+  - `validateToolArgs(inputSchema, args)`
+  - `errorToolEnvelope(...)`
+  - `toToolEnvelope(...)`
+  - `unwrapToolEnvelope(...)`
+- `src/tools.mjs` 在 `executeTool` 中统一校验参数，失败时返回 `errorCode: "invalid_tool_arguments"` 和 `issues[]`。
+- 关键工具已增加边界校验：
+  - 日程 `start/end`：日期或带时区 ISO8601
+  - 邮件/消息邮箱：邮箱或逗号分隔邮箱列表
+  - `web_fetch.url`：仅允许 http/https URL
+  - `run_shell_command.args`：必须是字符串数组
+- 已补充 `test/tool-schema.test.mjs`。
+
 建议修改范围：
 
 - `src/tools.mjs`
@@ -415,6 +454,26 @@ P1 目标是让记忆从“能保存”升级到“可治理、可解释、可�
 
 目标：将内部工具定义向标准协议靠拢，未来更容易接入外部工具生态。
 
+状态：已完成基础版。
+
+落地情况：
+
+- `getToolDescriptors(ctx)` 统一暴露工具 metadata：
+  - `name`
+  - `description`
+  - `inputSchema`
+  - `outputSchema`
+  - `policy`
+  - `examples`
+- `executeTool(name, args, ctx, { envelope: true })` 可返回统一 Envelope：
+  - `ok`
+  - `data`
+  - `error`
+  - `needConfirm`
+  - `securityRefusal`
+  - `trace`
+- 默认 `executeTool(name, args, ctx)` 仍返回旧格式，保持 Agent 和既有测试兼容。
+
 任务清单：
 
 - 标准化工具元数据：
@@ -444,6 +503,20 @@ P1 目标是让记忆从“能保存”升级到“可治理、可解释、可�
 
 目标：支持跨轮、可恢复的复杂任务，例如“整理会议 -> 生成报告 -> 发给某人”。
 
+状态：已完成持久化基础版，Agent 自动规划接入待后续迭代。
+
+落地情况：
+
+- 新增 `src/workflow.mjs`：
+  - `createWorkflow`
+  - `updateWorkflowStep`
+  - `requireWorkflowConfirmation`
+  - `resumeWorkflow`
+  - `advanceWorkflow`
+  - `failWorkflow`
+- `src/state-store.mjs` 新增 `workflows` 持久区，老状态文件加载时自动补齐。
+- 已补充跨实例恢复测试，覆盖等待确认、错误 token 不恢复、正确 resumeToken 继续。
+
 任务清单：
 
 - 新增 workflow 状态：
@@ -472,6 +545,16 @@ P1 目标是让记忆从“能保存”升级到“可治理、可解释、可�
 ### P2-4 执行前审计器
 
 目标：高风险操作确认前展示更清晰的审计信息。
+
+状态：已完成访客命令审批子路径，普通写工具审计摘要待后续补齐。
+
+落地情况：
+
+- `src/shell.mjs` 新增访客命令解析、审计和 approved sandbox executor。
+- Docker runner 下新增通用命令确认链路：不挂载 workspace；`ping` 走受限公网网络，`rm` 等删除/高风险写入命令拒绝。
+- `src/bot.mjs` 在群聊访客安全闸前识别命令类请求，先回复功能/风险/沙箱边界，再发主人确认卡片。
+- `src/approval.mjs` 支持 `sandbox_shell` executor，仍复用会话绑定、actionId、confirmToken 和卡片确认机制。
+- 已补充 `test/shell.test.mjs` 和 `test/runtime.test.mjs` 覆盖 apt install 规范化、复杂 shell 拒绝和审批恢复。
 
 任务清单：
 
@@ -588,10 +671,10 @@ P1 目标是让记忆从“能保存”升级到“可治理、可解释、可�
 6. P1-4 Memory Write Policy
 7. P1-3 冲突与废弃机制
 8. P1-5 Hybrid Retrieval
-9. P2-1 工具 Runtime Schema 校验
-10. P2-2 工具协议 MCP 化
-11. P2-4 执行前审计器
-12. P2-3 Durable Workflow
+9. P2-1 工具 Runtime Schema 校验（已完成基础版）
+10. P2-2 工具协议 MCP 化（已完成基础版）
+11. P2-3 Durable Workflow（已完成持久化基础版）
+12. P2-4 执行前审计器
 13. P3-1 缓存
 14. P3-2 健康检查
 15. P3-3 管理命令与报告

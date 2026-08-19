@@ -8,6 +8,7 @@ RUN apt-get update \
     findutils \
     git \
     grep \
+    iputils-ping \
     python3 \
     python-is-python3 \
     ripgrep \

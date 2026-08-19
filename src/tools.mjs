@@ -22,6 +22,13 @@ import { formatLarkFailureForTool } from './lark-errors.mjs';
 import { getOwnerName, getOwnerOpenId } from './owner.mjs';
 import { makeSafetyRefusal } from './safety-response.mjs';
 import {
+  GENERIC_TOOL_OUTPUT_SCHEMA,
+  errorToolEnvelope,
+  toToolEnvelope,
+  unwrapToolEnvelope,
+  validateToolArgs,
+} from './tool-schema.mjs';
+import {
   executePythonCodeSandbox,
   executeShellCommand,
   pythonCodeSandboxAvailable,
@@ -503,9 +510,7 @@ function confirmSingleAction(ctx, actionSpec, preview, toolName = 'write') {
 }
 
 function ownerAtText() {
-  const ownerOpenId = getOwnerOpenId();
-  const ownerName = getOwnerName();
-  return ownerOpenId ? `<at user_id="${ownerOpenId}">${escapeAtText(ownerName)}</at>` : ownerName;
+  return getOwnerName();
 }
 
 function confirmSingleWrite(ctx, finalArgs, preview, toolName = 'write') {
@@ -822,7 +827,7 @@ async function searchInternal(q, n) {
 }
 
 // ============ 工具定义 ============
-// 每个工具：{ name, description, parameters, ownerOnly?, protectsOwner?, run(args, ctx) }
+// 每个工具：{ name, description, parameters/inputSchema, ownerOnly?, protectsOwner?, run(args, ctx) }
 // ctx 提供：{ isOwner, senderName, chatId }
 const TOOLS = [
   {
@@ -979,8 +984,8 @@ const TOOLS = [
     parameters: {
       type: 'object',
       properties: {
-        start: { type: 'string', description: '开始时间，ISO8601 或 YYYY-MM-DD，缺省今天' },
-        end: { type: 'string', description: '结束时间，缺省与 start 同一天' },
+        start: { type: 'string', format: 'date-or-date-time', description: '开始时间，ISO8601 或 YYYY-MM-DD，缺省今天' },
+        end: { type: 'string', format: 'date-or-date-time', description: '结束时间，缺省与 start 同一天' },
       },
       required: [],
     },
@@ -1008,8 +1013,8 @@ const TOOLS = [
       type: 'object',
       properties: {
         summary: { type: 'string', description: '日程标题' },
-        start: { type: 'string', description: '开始时间，ISO8601 含时区' },
-        end: { type: 'string', description: '结束时间，ISO8601 含时区' },
+        start: { type: 'string', format: 'date-time', description: '开始时间，ISO8601 含时区' },
+        end: { type: 'string', format: 'date-time', description: '结束时间，ISO8601 含时区' },
         description: { type: 'string', description: '日程描述，可选' },
         attendee_names: { type: 'array', items: { type: 'string' }, description: '参会人姓名列表，可选（工具内部解析成 open_id）' },
       },
@@ -1095,7 +1100,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         summary: { type: 'string', description: '任务标题' },
-        due: { type: 'string', description: '截止时间，支持 YYYY-MM-DD / +2d / ISO8601，可选' },
+        due: { type: 'string', format: 'relative-date-or-date-time', description: '截止时间，支持 YYYY-MM-DD / +2d / ISO8601，可选' },
         assignee_name: { type: 'string', description: '受派人姓名，缺省即主人自己，可选' },
         description: { type: 'string', description: '任务描述，可选' },
       },
@@ -1131,12 +1136,12 @@ const TOOLS = [
       type: 'object',
       properties: {
         to_user_name: { type: 'string', description: '收件人姓名（私发）；同名时会要求澄清' },
-        to_user_email: { type: 'string', description: '收件人邮箱（私发，推荐）；用于精确锁定同名用户' },
+        to_user_email: { type: 'string', format: 'email', description: '收件人邮箱（私发，推荐）；用于精确锁定同名用户' },
         to_current_chat: { type: 'boolean', description: '为 true 时发到当前群；与 to_user_name/to_user_email 二选一' },
         text: { type: 'string', description: '纯文本内容（与 markdown 二选一）' },
         markdown: { type: 'string', description: 'markdown 内容（与 text 二选一）' },
         mention_user_names: { type: 'array', items: { type: 'string' }, description: '需要在消息里真正 @ 的用户姓名列表；工具会解析 open_id 并生成飞书 <at> 格式' },
-        mention_user_emails: { type: 'array', items: { type: 'string' }, description: '需要在消息里真正 @ 的用户邮箱列表；比姓名更适合处理同名' },
+        mention_user_emails: { type: 'array', items: { type: 'string', format: 'email' }, description: '需要在消息里真正 @ 的用户邮箱列表；比姓名更适合处理同名' },
         mention_all: { type: 'boolean', description: '是否 @所有人；仅用于群聊' },
       },
       required: [],
@@ -1234,11 +1239,11 @@ const TOOLS = [
     parameters: {
       type: 'object',
       properties: {
-        to: { type: 'string', description: '收件人邮箱，多个逗号分隔；与 to_name 二选一' },
+        to: { type: 'string', format: 'email-list', description: '收件人邮箱，多个逗号分隔；与 to_name 二选一' },
         to_name: { type: 'string', description: '收件人姓名（工具解析成邮箱）；与 to 二选一' },
         subject: { type: 'string', description: '邮件主题' },
         body: { type: 'string', description: '邮件正文，推荐 HTML' },
-        cc: { type: 'string', description: '抄送邮箱，多个逗号分隔，可选' },
+        cc: { type: 'string', format: 'email-list', description: '抄送邮箱，多个逗号分隔，可选' },
       },
       required: ['subject', 'body'],
     },
@@ -1273,7 +1278,7 @@ const TOOLS = [
       '仅支持公网 http/https 链接；会自动拒绝内网/本地地址。',
     parameters: {
       type: 'object',
-      properties: { url: { type: 'string', description: '要抓取的网页 URL（http/https）' } },
+      properties: { url: { type: 'string', format: 'http-url', description: '要抓取的网页 URL（http/https）' } },
       required: ['url'],
     },
     async run({ url }) {
@@ -1607,6 +1612,10 @@ const TOOLS = [
 
 const TOOL_MAP = new Map(TOOLS.map((t) => [t.name, t]));
 
+function toolInputSchema(tool) {
+  return tool.inputSchema || tool.parameters || { type: 'object', properties: {}, required: [] };
+}
+
 function toolRuntimeAvailable(tool) {
   if (tool.name === 'run_python_code') return pythonCodeSandboxAvailable();
   if (tool.name === 'run_shell_command') return shellEnabled();
@@ -1615,11 +1624,26 @@ function toolRuntimeAvailable(tool) {
 
 // 给 LLM 的工具 schema（OpenAI function calling 格式）
 export function getToolSchemas(ctx = {}) {
-  return TOOLS
-    .filter((t) => toolRuntimeAvailable(t) && authorizeTool(t.name, {}, ctx).ok)
+  return getToolDescriptors(ctx)
     .map((t) => ({
       type: 'function',
-      function: { name: t.name, description: t.description, parameters: t.parameters },
+      function: { name: t.name, description: t.description, parameters: t.inputSchema },
+    }));
+}
+
+export function getToolDescriptors(ctx = {}) {
+  return TOOLS
+    .filter((t) => toolRuntimeAvailable(t) && authorizeTool(t.name, {}, ctx).ok)
+    .map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: toolInputSchema(tool),
+      outputSchema: tool.outputSchema || GENERIC_TOOL_OUTPUT_SCHEMA,
+      policy: {
+        ...getToolMetadata(tool.name, {}),
+        protectsOwner: Boolean(tool.protectsOwner),
+      },
+      examples: Array.isArray(tool.examples) ? tool.examples : [],
     }));
 }
 
@@ -1641,26 +1665,47 @@ export function getToolMetadata(name, args = {}) {
   return { ...policy, effect: classified.ok && !classified.isWrite ? 'read' : 'write' };
 }
 
-// 执行工具（带权限门禁）。返回值会被 JSON 序列化回灌给 LLM。
-export async function executeTool(name, args, ctx) {
+// 执行工具（带权限门禁）。默认返回旧格式；opts.envelope=true 时返回统一 envelope。
+export async function executeTool(name, args, ctx, opts = {}) {
+  const started = Date.now();
+  const finish = (envelope) => {
+    const withDuration = {
+      ...envelope,
+      trace: {
+        ...(envelope.trace || {}),
+        toolName: name || envelope.trace?.toolName || '',
+        durationMs: Date.now() - started,
+      },
+    };
+    return opts?.envelope ? withDuration : unwrapToolEnvelope(withDuration);
+  };
   const tool = TOOL_MAP.get(name);
-  if (!tool) return { error: `未知工具：${name}` };
-  if (!toolRuntimeAvailable(tool)) return { error: `工具未启用：${name}` };
+  if (!tool) {
+    return finish(errorToolEnvelope({ code: 'unknown_tool', message: `未知工具：${name}` }, { toolName: name, code: 'unknown_tool' }));
+  }
+  if (!toolRuntimeAvailable(tool)) {
+    return finish(errorToolEnvelope({ code: 'tool_unavailable', message: `工具未启用：${name}` }, { toolName: name, code: 'tool_unavailable' }));
+  }
   const auth = authorizeTool(name, args || {}, ctx);
   if (!auth.ok) {
     console.warn(`[tool] 访问工具 ${name} 被策略拒绝：${auth.reason}`);
-    return makeSafetyRefusal({
+    return finish(toToolEnvelope(makeSafetyRefusal({
       text: `${name} ${JSON.stringify(args || {})}`,
       reason: auth.reason,
       ownerName: getOwnerName(),
-    });
+    }), { toolName: name }));
+  }
+  const validated = validateToolArgs(toolInputSchema(tool), args || {});
+  if (!validated.ok) {
+    console.warn(`[tool] ${name} 参数校验失败：${validated.error.message}`);
+    return finish(errorToolEnvelope(validated.error, { toolName: name, code: 'invalid_tool_arguments' }));
   }
   try {
-    const result = await tool.run(args || {}, ctx);
-    return result;
+    const result = await tool.run(validated.value, ctx);
+    return finish(toToolEnvelope(result, { toolName: name }));
   } catch (err) {
     console.error(`[tool] ${name} 执行异常：`, err.message);
-    return { error: `工具执行失败：${err.message}` };
+    return finish(errorToolEnvelope({ code: 'tool_exception', message: `工具执行失败：${err.message}` }, { toolName: name, code: 'tool_exception' }));
   }
 }
 

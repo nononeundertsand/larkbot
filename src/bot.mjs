@@ -11,6 +11,7 @@
 
 import './bootstrap-env.mjs'; // 必须最先执行：在其它模块读 env 前加载 .env（正确处理带引号的 JSON 值）
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import readline from 'node:readline';
 import { runAgent } from './agent.mjs';
 import { assessSafety, llmConfigured } from './reply.mjs';
@@ -32,8 +33,19 @@ import { SessionQueue } from './session-queue.mjs';
 import { RuntimeStateStore } from './state-store.mjs';
 import { formatLarkFailureForUser, formatLarkSuccessForUser } from './lark-errors.mjs';
 import { getOwnerName, getOwnerOpenId, initOwnerIdentity, isOwnerSender, maskId } from './owner.mjs';
+import { containsLarkAtTag, larkAtTag, postContentFromTextWithMentions } from './lark-format.mjs';
+import { splitReplyText } from './reply-parts.mjs';
 import { formatSafetyRefusal } from './safety-response.mjs';
-import { executeApprovedShellAction, formatShellResultForUser, shellDockerEnabled, shellEnabled } from './shell.mjs';
+import {
+  executeApprovedSandboxShellAction,
+  executeApprovedShellAction,
+  formatSandboxShellResultForUser,
+  formatShellResultForUser,
+  reviewSandboxCommandRequest,
+  sandboxShellApprovalPreview,
+  shellDockerEnabled,
+  shellEnabled,
+} from './shell.mjs';
 
 const LARK_CLI = process.env.LARK_CLI_BIN || 'lark-cli';
 const EVENT_KEY = 'im.message.receive_v1';
@@ -41,6 +53,8 @@ const CARD_ACTION_EVENT_KEY = 'card.action.trigger';
 const IDENTITY = process.env.LARK_IDENTITY || 'bot'; // 回复身份：bot | user
 const RECONNECT_DELAY_MS = 3000;
 const APPROVAL_CARD_ENABLED = (process.env.APPROVAL_CARD_ENABLED || 'on').toLowerCase() !== 'off';
+const MULTI_REPLY_ENABLED = (process.env.MULTI_REPLY_ENABLED || 'on').toLowerCase() !== 'off';
+const MULTI_REPLY_MAX_PARTS = Number(process.env.MULTI_REPLY_MAX_PARTS || 3);
 // 机器人主人（专属服务对象）的 open_id：其消息完全信任；其他人的请求要过安全评估。
 let OWNER_OPEN_ID = getOwnerOpenId();
 let OWNER_NAME = getOwnerName();
@@ -245,12 +259,21 @@ function stripMention(text, mentions) {
 
 // 调 lark-cli 回帖。用数组传参（非 shell 字符串），彻底避免转义/注入问题。
 async function replyMessage(messageId, text) {
-  const r = await runLark([
-    'im', '+messages-reply',
-    '--message-id', messageId,
-    '--markdown', text,
-    '--as', IDENTITY,
-  ]);
+  const args = containsLarkAtTag(text)
+    ? [
+      'im', '+messages-reply',
+      '--message-id', messageId,
+      '--msg-type', 'post',
+      '--content', JSON.stringify(postContentFromTextWithMentions(text)),
+      '--as', IDENTITY,
+    ]
+    : [
+      'im', '+messages-reply',
+      '--message-id', messageId,
+      '--markdown', text,
+      '--as', IDENTITY,
+    ];
+  const r = await runLark(args);
   const ok = r.code === 0 && (r.json ? r.json.ok !== false : true);
   if (ok) console.log(`[reply] ✅ 已回复 ${messageId}`);
   else console.error(`[reply] ❌ 回复失败 ${messageId} (code=${r.code}): ${r.err.trim() || r.out.trim()}`);
@@ -292,6 +315,10 @@ async function executePendingApproval(pending) {
     const r = await executeApprovedShellAction(pending.shell);
     return formatShellResultForUser(pending, r);
   }
+  if (pending.executor === 'sandbox_shell') {
+    const r = await executeApprovedSandboxShellAction(pending.shell);
+    return formatSandboxShellResultForUser(pending, r);
+  }
   const r = await runLark(pending.args);
   if (r.code !== 0 || r.json?.ok === false) return formatLarkFailureForUser(r);
   return formatLarkSuccessForUser(pending, r);
@@ -303,7 +330,110 @@ async function replyAgentResponse(messageId, response) {
     const cardSent = await replyApprovalCard(messageId, response.approvalAction);
     if (cardSent) return true;
   }
-  return replyMessage(messageId, text);
+  const parts = splitReplyText(text, {
+    enabled: MULTI_REPLY_ENABLED,
+    maxParts: MULTI_REPLY_MAX_PARTS,
+  });
+  let ok = true;
+  for (const part of parts) {
+    ok = await replyMessage(messageId, part) && ok;
+  }
+  return ok;
+}
+
+function ownerAtText() {
+  return OWNER_OPEN_ID ? larkAtTag(OWNER_OPEN_ID, OWNER_NAME) : OWNER_NAME;
+}
+
+function ownerPlainText() {
+  return OWNER_NAME;
+}
+
+function confirmationMessage(preview, token) {
+  return `${String(preview || '').trim()}\n确认码：${token}\n请回复「确认 ${token}」执行，或「取消」放弃。`;
+}
+
+async function commandSearchNote(review) {
+  if (review.sandboxMode === 'apt_install') return '';
+  const known = new Set(['ls', 'pwd', 'cat', 'find', 'grep', 'rg', 'git', 'npm', 'python', 'python3', 'curl', 'wget', 'neofetch']);
+  const command = String(review.command || '').toLowerCase();
+  if (!command || known.has(command)) return '';
+  try {
+    const result = await executeTool('web_search', { query: `${command} linux command`, limit: 2 }, { isOwner: false });
+    const rows = Array.isArray(result?.results) ? result.results.slice(0, 2) : [];
+    if (!rows.length) return '';
+    return [
+      '联网检索：',
+      ...rows.map((item) => `- ${item.title || item.url || '搜索结果'}：${String(item.snippet || item.summary || '').replace(/\s+/g, ' ').slice(0, 160)}`),
+    ].join('\n');
+  } catch (err) {
+    console.warn(`[command] 命令说明联网检索失败：${err.message}`);
+    return '';
+  }
+}
+
+async function handleVisitorSandboxCommandRequest(messageId, text, {
+  chatId,
+  senderName,
+  senderDept = '',
+  confirmationKey,
+} = {}) {
+  const review = reviewSandboxCommandRequest({
+    text,
+    purpose: `访客 ${senderName || '其他用户'} 在群聊请求执行命令`,
+  });
+  if (!review.ok && review.kind === 'none') return false;
+
+  if (!review.ok) {
+    const sent = await replyMessage(messageId, [
+      '我识别到这是一条命令类请求，但不会进入执行确认。',
+      '',
+      `原始内容：\`${String(review.rawCommand || text).replace(/`/g, '\\`')}\``,
+      `原因：${review.reason}`,
+      '处理结果：不执行，也不发起确认卡片。请改成单个结构化命令，避免管道、重定向、多命令连接符或交互式 shell。',
+    ].join('\n'));
+    if (!sent) forgetHandled(messageId);
+    return true;
+  }
+  if (!confirmationKey) {
+    const sent = await replyMessage(messageId, '我识别到这是一条命令类请求，但当前没有可用的主人确认会话。请先配置 OWNER_OPEN_ID 后再发起。');
+    if (!sent) forgetHandled(messageId);
+    return true;
+  }
+
+  const requester = `${senderName || '其他用户'}${senderDept ? ` / ${senderDept}` : ''}`;
+  const preview = sandboxShellApprovalPreview(review, { requester, ownerAt: ownerPlainText() });
+  const confirmToken = randomUUID().replace(/-/g, '').slice(0, 6).toUpperCase();
+  const action = {
+    id: randomUUID(),
+    toolName: 'visitor_sandbox_command',
+    executor: 'sandbox_shell',
+    shell: review.action,
+    preview: confirmationMessage(preview, confirmToken),
+    confirmToken,
+    createdAt: Date.now(),
+    confirmationKey,
+  };
+  const registered = approvals.register(confirmationKey, action);
+  const lookupNote = await commandSearchNote(review);
+  const analysis = [
+    `已识别为命令执行请求：\`${String(review.rawCommand || review.displayCommand).replace(/`/g, '\\`')}\``,
+    '',
+    `功能：${review.sandboxMode === 'apt_install' ? `安装软件包 ${review.packages.join('、')}` : review.displayCommand}`,
+    lookupNote,
+    `风险：${review.risk}。${review.reason}`,
+    `沙箱：Docker，workspace=none，network=${review.network || 'none'}，rootfs=${review.readOnlyRootfs === false ? '临时可写' : '只读'}。`,
+    `${ownerAtText()} 我已生成确认卡片；你确认后才会在沙箱里执行。`,
+  ].join('\n');
+  const sent = await replyMessage(messageId, analysis);
+  if (!sent) {
+    forgetHandled(messageId);
+    return true;
+  }
+  const cardSent = await replyApprovalCard(messageId, registered);
+  if (!cardSent) await replyMessage(messageId, registered.preview);
+  console.log(`[command] visitor sandbox approval action=${registered.id.slice(0, 8)} chat=${chatId || ''}`);
+  return true;
 }
 
 // 统一的「问答（含写操作二次确认）」处理：
@@ -411,6 +541,16 @@ async function handleEvent(evt) {
     }
     await resolveVisitor(); // 解析访客姓名+部门
     console.log(`[recv] group@ ${whoLabel()} sender=${maskId(senderId)} msg=${messageId} <- ${contentPreview(renderedUserText)}`);
+
+    if (!isOwner) {
+      const handledCommand = await handleVisitorSandboxCommandRequest(messageId, renderedUserText, {
+        chatId: d.chat_id,
+        senderName,
+        senderDept: senderProfile?.department || '',
+        confirmationKey: OWNER_OPEN_ID ? `g:${d.chat_id}:${OWNER_OPEN_ID}` : '',
+      });
+      if (handledCommand) return;
+    }
 
     // 安全闸（访客）：先挡明显的凭证索取 / 提示词注入等硬风险；
     // 更细的越权（查主人隐私等）由工具层的权限门禁精确控制。

@@ -94,7 +94,9 @@
 | **提示词注入防护** | 用户输入、长期记忆、网页/邮件/群聊工具结果分别使用不可信边界；外部数据不能驱动私密读取，私密数据不能静默外联。 |
 | **中央能力策略** | Policy Engine 按主人/访客、public/group/private、read/write、trusted/external 强制鉴权；访客看不到主人专属工具。 |
 | **写操作二次确认** | 每轮最多登记一个副作用，确认绑定具体会话、actionId 和短确认码；默认发送「确认/取消」交互卡片，按钮不可用时可回复「确认 ABC123」兜底，裸「确认/ok」不会触发。 |
-| **Shell 沙箱与命令审核** | Shell 默认关闭；开启后仅主人可用，采用结构化 argv、命令 allowlist、敏感路径拒绝、隔离 HOME/TMP、超时/输出上限和确认码机制；本机 runner 访问 Mac 文件系统一律确认，生产建议开启 Docker runner，把执行隔离到无网络、只读 workspace、受资源限制的容器内。 |
+| **Shell 沙箱与命令审核** | Shell 默认关闭；开启后采用结构化 argv、敏感路径拒绝、隔离 HOME/TMP、超时/输出上限和确认码机制；本机 runner 仍使用严格 allowlist，Docker runner 可让通用命令进入确认链路，并默认不挂载 workspace。`ping` 等网络诊断命令会限制公网目标和次数。 |
+| **访客命令审批** | 群聊访客 @ 机器人发送命令类内容时，bot 会先解析命令、解释功能和风险，再 @ 主人发送确认/取消卡片；确认后只在不挂载 workspace 的临时 Docker 沙箱中执行。`apt install` 类命令会转为临时容器内安装，`ping` 会自动限制包数量；`rm` 等删除/高风险写入命令、复杂 shell 语法、管道和重定向不进入审批链。 |
+| **多条回复** | 普通回答支持按空行拆成多条飞书回复，让群聊互动更像真人连续发言；代码块、表格、列表、确认码和命令输出会保持单条，避免格式被拆坏。 |
 | **访客 Python 沙箱** | 访客只可用 `run_python_code`，不开放 Shell；该工具不挂载 workspace、禁网络、只返回 stdout/stderr，运行结果视为不可信外部数据。 |
 | **网络 SSRF 防护** | 每一跳重定向都重新校验协议、DNS/IP 和内网段；流式限制响应体，带鉴权的内网请求禁止跨主机重定向。 |
 | **限流防刷** | 访客 5 次/60s/人；全局并发上限 3。主人不受限。 |
@@ -195,6 +197,7 @@ tail -f /tmp/larkbot.log
 | `SECURITY_REFUSAL_STYLE` | 安全 | 访客高风险请求的拒绝语气：`teasing`（默认，轻微挑衅）/ `firm`（严肃） |
 | `RESOLVE_VISITOR` | 访客 | 设 `off` 关闭访客身份解析 |
 | `AGENT_MAX_ITERS` / `AGENT_MAX_TOOL_CALLS` | Agent | 最大图迭代（默认 6）/ 单次请求工具调用预算（默认 10） |
+| `MULTI_REPLY_ENABLED` / `MULTI_REPLY_MAX_PARTS` | 体验 | 是否允许普通回答拆成多条飞书回复（默认 `on`）/ 最多拆分条数（默认 3） |
 | `AGENT_ENGINE` / `ALLOW_UNSAFE_LEGACY` | Agent | 旧运行时仅调试可用，必须同时设 `legacy` / `1` |
 | `LARK_TIMEOUT_MS` / `LARK_MAX_OUTPUT_BYTES` | lark-cli | 子进程超时（默认 30s）/ 输出上限（默认 2MB） |
 | `SHELL_ENABLED` / `SHELL_SANDBOX_ROOT` | Shell | 受限 Shell 开关（默认 `off`）/ 沙箱根目录（默认项目根） |

@@ -8,6 +8,7 @@ const DEFAULT_EVENT_TTL_MS = 7 * 24 * 3600 * 1000;
 const DEFAULT_MAX_PROCESSED_EVENTS = 5000;
 const DEFAULT_MAX_RUNS = 1000;
 const DEFAULT_MAX_TOOL_CALLS = 5000;
+const DEFAULT_MAX_WORKFLOWS = 200;
 
 function nowMs() {
   return Date.now();
@@ -21,6 +22,7 @@ function defaultData() {
     agentRuns: [],
     toolCalls: [],
     memoryJobs: [],
+    workflows: {},
     updatedAt: new Date().toISOString(),
   };
 }
@@ -48,6 +50,7 @@ export class RuntimeStateStore {
     maxProcessedEvents = Number(process.env.AGENT_STATE_MAX_EVENTS || DEFAULT_MAX_PROCESSED_EVENTS),
     maxAgentRuns = Number(process.env.AGENT_STATE_MAX_RUNS || DEFAULT_MAX_RUNS),
     maxToolCalls = Number(process.env.AGENT_STATE_MAX_TOOL_CALLS || DEFAULT_MAX_TOOL_CALLS),
+    maxWorkflows = Number(process.env.AGENT_STATE_MAX_WORKFLOWS || DEFAULT_MAX_WORKFLOWS),
     logger = console,
   } = {}) {
     this.file = file;
@@ -56,6 +59,7 @@ export class RuntimeStateStore {
     this.maxProcessedEvents = Math.max(1, Number(maxProcessedEvents) || DEFAULT_MAX_PROCESSED_EVENTS);
     this.maxAgentRuns = Math.max(1, Number(maxAgentRuns) || DEFAULT_MAX_RUNS);
     this.maxToolCalls = Math.max(1, Number(maxToolCalls) || DEFAULT_MAX_TOOL_CALLS);
+    this.maxWorkflows = Math.max(1, Number(maxWorkflows) || DEFAULT_MAX_WORKFLOWS);
     this.logger = logger;
     this.data = defaultData();
     if (this.enabled) this.load();
@@ -74,6 +78,7 @@ export class RuntimeStateStore {
         agentRuns: Array.isArray(data.agentRuns) ? data.agentRuns : [],
         toolCalls: Array.isArray(data.toolCalls) ? data.toolCalls : [],
         memoryJobs: Array.isArray(data.memoryJobs) ? data.memoryJobs : [],
+        workflows: data.workflows && typeof data.workflows === 'object' && !Array.isArray(data.workflows) ? data.workflows : {},
       };
       this.pruneAll({ save: false });
     } catch (err) {
@@ -96,6 +101,7 @@ export class RuntimeStateStore {
     this.pruneProcessedEvents({ save: false });
     this.pruneAgentRuns({ save: false });
     this.pruneToolCalls({ save: false });
+    this.pruneWorkflows({ save: false });
     if (save) this.save();
   }
 
@@ -208,6 +214,74 @@ export class RuntimeStateStore {
 
   pruneToolCalls({ save = true } = {}) {
     this.data.toolCalls = (this.data.toolCalls || []).slice(-this.maxToolCalls);
+    if (save) this.save();
+  }
+
+  saveWorkflow(workflow) {
+    if (!this.enabled) return false;
+    const cloned = safeClone(workflow);
+    const workflowId = String(cloned?.workflowId || '').trim();
+    if (!cloned || !workflowId) return false;
+    const now = new Date().toISOString();
+    this.data.workflows[workflowId] = {
+      ...cloned,
+      workflowId,
+      createdAt: cloned.createdAt || now,
+      updatedAt: now,
+    };
+    this.pruneWorkflows({ save: false });
+    this.save();
+    return true;
+  }
+
+  getWorkflow(workflowId) {
+    const id = String(workflowId || '').trim();
+    if (!id) return null;
+    return safeClone(this.data.workflows?.[id] || null);
+  }
+
+  listWorkflows({ status, sessionKey } = {}) {
+    const items = Object.values(this.data.workflows || {});
+    return items
+      .filter((workflow) => !status || workflow.status === status)
+      .filter((workflow) => !sessionKey || workflow.sessionKey === sessionKey)
+      .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
+      .map((workflow) => safeClone(workflow));
+  }
+
+  updateWorkflow(workflowId, patchOrUpdater) {
+    if (!this.enabled) return null;
+    const current = this.getWorkflow(workflowId);
+    if (!current) return null;
+    const patch = typeof patchOrUpdater === 'function'
+      ? patchOrUpdater(safeClone(current))
+      : patchOrUpdater;
+    const next = {
+      ...current,
+      ...(patch && typeof patch === 'object' ? patch : {}),
+      workflowId: current.workflowId,
+    };
+    return this.saveWorkflow(next) ? this.getWorkflow(current.workflowId) : null;
+  }
+
+  deleteWorkflow(workflowId) {
+    const id = String(workflowId || '').trim();
+    if (!id || !this.enabled) return false;
+    if (!this.data.workflows?.[id]) return false;
+    delete this.data.workflows[id];
+    this.save();
+    return true;
+  }
+
+  pruneWorkflows({ save = true } = {}) {
+    const entries = Object.entries(this.data.workflows || {})
+      .sort((a, b) => {
+        const at = Date.parse(a[1]?.updatedAt || a[1]?.createdAt || 0) || 0;
+        const bt = Date.parse(b[1]?.updatedAt || b[1]?.createdAt || 0) || 0;
+        return bt - at;
+      })
+      .slice(0, this.maxWorkflows);
+    this.data.workflows = Object.fromEntries(entries);
     if (save) this.save();
   }
 }
