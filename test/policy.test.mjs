@@ -196,6 +196,7 @@ test('send_message 支持按邮箱精确指定私发收件人', () => {
   assert.ok(schema.function.parameters.properties.to_user_email);
   assert.ok(schema.function.parameters.properties.mention_user_names);
   assert.ok(schema.function.parameters.properties.mention_user_emails);
+  assert.ok(schema.function.parameters.properties.mention_bot_names);
   assert.ok(schema.function.parameters.properties.mention_all);
 });
 
@@ -203,6 +204,10 @@ test('send_message 会把可见 @ 文本转换成飞书 mention 标签', () => {
   assert.deepEqual(__testing.inferMentionTargets('请 @张三 和 ＠李四 看一下，@所有人 同步'), {
     names: ['张三', '李四'],
     all: true,
+  });
+  assert.deepEqual(__testing.inferMentionTargets('@刘威的智能助手 @王冠翔的智能伙伴 @刘威的飞书 CLI\n喵喵喵～'), {
+    names: ['刘威的智能助手', '王冠翔的智能伙伴', '刘威的飞书 CLI'],
+    all: false,
   });
   assert.equal(
     __testing.applyMentionsToContent('请 @张三 看一下', [{ openId: 'ou_zhang', display: '张三', requested: '张三' }]),
@@ -216,6 +221,36 @@ test('send_message 会把可见 @ 文本转换成飞书 mention 标签', () => {
     __testing.applyMentionsToContent('@所有人 周会开始', [{ openId: 'all', display: '所有人', requested: '所有人' }]),
     '<at user_id="all"></at> 周会开始',
   );
+  assert.equal(
+    __testing.applyMentionsToContent('@刘威的飞书 CLI 喵喵喵', [{ openId: 'ou_bot_cli', display: '刘威的飞书 CLI', requested: '刘威的飞书 CLI' }]),
+    '<at user_id="ou_bot_cli">刘威的飞书 CLI</at> 喵喵喵',
+  );
+  const bots = [
+    { app_id: 'cli_alpha', member_id: 'ou_bot_alpha', name: 'AlphaBot' },
+    { app_id: 'cli_beta', member_id: 'ou_bot_beta', app_name: 'Beta助手' },
+  ];
+  assert.equal(__testing.botMemberDisplayName(bots[1]), 'Beta助手');
+  assert.equal(__testing.botMentionId(bots[0]), 'ou_bot_alpha');
+  assert.deepEqual(__testing.matchBotMembersByLabel(bots, 'Beta助手').map((bot) => bot.app_id), ['cli_beta']);
+  assert.deepEqual(__testing.matchBotMembersByLabel(bots, 'cli_alpha').map((bot) => bot.member_id), ['ou_bot_alpha']);
+});
+
+test('普通群聊回复里的可见 @ 可转成真实 mention 标签', async () => {
+  const converted = await __testing.resolveVisibleMentionsInContent(
+    '@王冠翔的智能伙伴 喵喵～',
+    { chatId: 'oc_test' },
+    async () => ({
+      code: 0,
+      json: {
+        data: {
+          bots: [
+            { app_id: 'cli_partner', member_id: 'ou_bot_partner', name: '王冠翔的智能伙伴' },
+          ],
+        },
+      },
+    }),
+  );
+  assert.equal(converted, '<at user_id="ou_bot_partner">王冠翔的智能伙伴</at> 喵喵～');
 });
 
 test('图片消息 key 支持占位符和 JSON content 提取', () => {

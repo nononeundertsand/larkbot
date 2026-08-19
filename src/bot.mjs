@@ -25,7 +25,7 @@ import {
   maintainGroupMemory,
   flushMemory,
 } from './memory.mjs';
-import { getToolSchemas, getToolMetadata, executeTool, getRecentChatContext, renderMessageContent } from './tools.mjs';
+import { getToolSchemas, getToolMetadata, executeTool, getRecentChatContext, renderMessageContent, resolveVisibleMentionsInContent } from './tools.mjs';
 import { runLark } from './lark.mjs';
 import { ApprovalStore } from './approval.mjs';
 import { buildApprovalCard, buildApprovalStatusCard, parseApprovalActionValue } from './approval-card.mjs';
@@ -324,8 +324,9 @@ async function executePendingApproval(pending) {
   return formatLarkSuccessForUser(pending, r);
 }
 
-async function replyAgentResponse(messageId, response) {
-  const text = typeof response === 'string' ? response : String(response?.text || '');
+async function replyAgentResponse(messageId, response, { chatId = '' } = {}) {
+  const rawText = typeof response === 'string' ? response : String(response?.text || '');
+  const text = chatId ? await resolveVisibleMentionsInContent(rawText, { chatId }) : rawText;
   if (response?.approvalAction) {
     const cardSent = await replyApprovalCard(messageId, response.approvalAction);
     if (cardSent) return true;
@@ -592,7 +593,7 @@ async function handleEvent(evt) {
       threadContext,
     }, gKey.id, isOwner);
     const answer = response.text;
-    const sent = await replyAgentResponse(messageId, response);
+    const sent = await replyAgentResponse(messageId, response, { chatId: d.chat_id });
     if (!sent) {
       forgetHandled(messageId);
       return;

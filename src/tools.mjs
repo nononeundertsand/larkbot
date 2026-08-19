@@ -175,6 +175,75 @@ async function resolvePersonByEmail(email) {
   return { ok: true, user: exact[0] };
 }
 
+function botMemberDisplayName(bot = {}) {
+  const i18n = bot.i18n_name || bot.i18n_names || {};
+  return String(
+    bot.name ||
+    bot.app_name ||
+    bot.bot_name ||
+    bot.localized_name ||
+    i18n.zh_cn ||
+    i18n.en_us ||
+    bot.app_id ||
+    bot.member_id ||
+    '',
+  ).trim();
+}
+
+function botMemberAliases(bot = {}) {
+  const name = botMemberDisplayName(bot);
+  return [...new Set([
+    name,
+    bot.name,
+    bot.app_name,
+    bot.bot_name,
+    bot.localized_name,
+    bot.app_id,
+    bot.member_id,
+    bot.open_id,
+  ].map((item) => String(item || '').trim()).filter(Boolean))];
+}
+
+function botMentionId(bot = {}) {
+  return String(bot.member_id || bot.open_id || bot.app_id || '').trim();
+}
+
+function matchBotMembersByLabel(bots = [], label = '') {
+  const q = String(label || '').trim();
+  if (!q) return [];
+  const lower = q.toLowerCase();
+  const exact = bots.filter((bot) => botMemberAliases(bot).some((alias) => alias.toLowerCase() === lower));
+  if (exact.length) return exact;
+  return bots.filter((bot) => botMemberAliases(bot).some((alias) => alias.toLowerCase().includes(lower)));
+}
+
+async function resolveBotMentionInChat(chatId, label, runner = runLark) {
+  const q = String(label || '').trim();
+  if (!q) return { ok: false, reason: '缺少机器人名称' };
+  if (!chatId) return { ok: false, reason: '只有当前群聊里才能按名称解析机器人' };
+  const r = await runner([
+    'im', '+chat-members-list',
+    '--chat-id', chatId,
+    '--member-types', 'bot',
+    '--page-all',
+    '--as', 'bot',
+  ]);
+  if (r.code !== 0 || r.json?.ok === false) return { ok: false, reason: '读取群机器人列表失败' };
+  const bots = r.json?.data?.bots || [];
+  const candidates = matchBotMembersByLabel(bots, q)
+    .map((bot) => ({
+      openId: botMentionId(bot),
+      display: botMemberDisplayName(bot) || q,
+      name: botMemberDisplayName(bot) || q,
+      appId: bot.app_id || '',
+      requested: q,
+      kind: 'bot',
+    }))
+    .filter((bot) => bot.openId);
+  if (candidates.length === 0) return { ok: false, reason: `当前群里没找到机器人「${q}」` };
+  return { ok: true, candidates };
+}
+
 function normalizeStringList(value) {
   if (value == null) return [];
   const list = Array.isArray(value) ? value : [value];
@@ -206,18 +275,51 @@ function mentionLabels(mention) {
 function inferMentionTargets(content) {
   const names = [];
   let all = false;
+  const addName = (raw) => {
+    const name = String(raw || '').trim();
+    if (!name) return;
+    if (name === '所有人' || /^all$/i.test(name)) {
+      all = true;
+      return;
+    }
+    const shorter = names.find((item) => name.startsWith(item) && name.length > item.length);
+    if (shorter) names.splice(names.indexOf(shorter), 1, name);
+    else if (!names.some((item) => item === name || item.startsWith(name))) names.push(name);
+  };
   const text = String(content || '');
   const re = /(^|[\s，,。；;：:、（(])[@＠]([^\s，,。；;：:、）)!！?？.<>"'`]{1,32})/g;
   for (const match of text.matchAll(re)) {
-    const label = String(match[2] || '').trim();
-    if (!label) continue;
-    if (label === '所有人' || /^all$/i.test(label)) {
-      all = true;
-      continue;
+    addName(match[2]);
+  }
+
+  // Bot names can contain spaces, e.g. "@刘威的飞书 CLI". Keep this conservative:
+  // only add the longer span when it looks like a bot/app label.
+  const botLikeRe = /[@＠]([^@＠\n\r，,。；;：:、）)!！?？<>"'`]{1,64})/g;
+  for (const match of text.matchAll(botLikeRe)) {
+    let label = trimBotMentionLabel(match[1]);
+    label = label.replace(/\s+(?:和|与|以及|跟|并|然后)$/u, '').trim();
+    const botLike = /(机器人|助手|伙伴|飞书\s*CLI|\bcli_[a-z0-9_]+)/i.test(label);
+    if (botLike) {
+      addName(label);
     }
-    if (!names.includes(label)) names.push(label);
   }
   return { names, all };
+}
+
+function trimBotMentionLabel(label) {
+  const raw = String(label || '').trim();
+  const patterns = [
+    /^(.+?机器人)(?=\s|$)/u,
+    /^(.+?助手)(?=\s|$)/u,
+    /^(.+?伙伴)(?=\s|$)/u,
+    /^(.+?飞书\s*CLI)(?=\s|$)/iu,
+    /^(cli_[a-z0-9_]+)/i,
+  ];
+  for (const re of patterns) {
+    const match = raw.match(re);
+    if (match?.[1]) return match[1].trim();
+  }
+  return raw;
 }
 
 export function applyMentionsToContent(content, mentions = []) {
@@ -242,7 +344,7 @@ function previewMentionContent(content) {
     .replace(/<at\s+user_id=["'][^"']+["']\s*>(.*?)<\/at>/g, (_m, name) => `@${name || '某人'}`);
 }
 
-async function resolveMessageMentions({ mention_user_names, mention_user_emails, mention_all } = {}) {
+async function resolveMessageMentions({ mention_user_names, mention_user_emails, mention_bot_names, mention_all, chatId, runner = runLark } = {}) {
   const mentions = [];
   if (mention_all) mentions.push({ openId: 'all', display: '所有人', requested: '所有人' });
 
@@ -260,7 +362,15 @@ async function resolveMessageMentions({ mention_user_names, mention_user_emails,
 
   for (const name of normalizeStringList(mention_user_names)) {
     const rp = await resolvePersonToOpenId(name);
-    if (!rp.ok) return { ok: false, error: `艾特对象「${name}」解析失败：${rp.reason}` };
+    if (!rp.ok) {
+      const bot = await resolveBotMentionInChat(chatId, name, runner);
+      if (!bot.ok) return { ok: false, error: `艾特对象「${name}」解析失败：${rp.reason}；${bot.reason}` };
+      if (bot.candidates.length > 1) {
+        return { ok: false, needClarify: true, forName: name, candidates: bot.candidates.map(({ openId, ...x }) => x) };
+      }
+      mentions.push(bot.candidates[0]);
+      continue;
+    }
     if (rp.candidates.length > 1) {
       return { ok: false, needClarify: true, forName: name, candidates: rp.candidates.map(({ openId, ...x }) => x) };
     }
@@ -274,6 +384,15 @@ async function resolveMessageMentions({ mention_user_names, mention_user_emails,
     });
   }
 
+  for (const name of normalizeStringList(mention_bot_names)) {
+    const bot = await resolveBotMentionInChat(chatId, name, runner);
+    if (!bot.ok) return { ok: false, error: `艾特机器人「${name}」解析失败：${bot.reason}` };
+    if (bot.candidates.length > 1) {
+      return { ok: false, needClarify: true, forName: name, candidates: bot.candidates.map(({ openId, ...x }) => x) };
+    }
+    mentions.push(bot.candidates[0]);
+  }
+
   const unique = [];
   const seen = new Set();
   for (const mention of mentions) {
@@ -282,6 +401,21 @@ async function resolveMessageMentions({ mention_user_names, mention_user_emails,
     unique.push(mention);
   }
   return { ok: true, mentions: unique };
+}
+
+export async function resolveVisibleMentionsInContent(content, { chatId = '' } = {}, runner = runLark) {
+  const text = String(content || '');
+  if (!chatId || !/[@＠]/.test(text)) return text;
+  const inferred = inferMentionTargets(text);
+  if (!inferred.names.length && !inferred.all) return text;
+  const resolved = await resolveMessageMentions({
+    mention_user_names: inferred.names,
+    mention_all: inferred.all,
+    chatId,
+    runner,
+  });
+  if (!resolved.ok || resolved.needClarify || !resolved.mentions.length) return text;
+  return applyMentionsToContent(text, resolved.mentions);
 }
 
 async function fetchChatMessages(chatId, { limit = 50, sort = 'desc', start = '' } = {}) {
@@ -1131,7 +1265,7 @@ const TOOLS = [
     description:
       '以机器人身份代主人发送一条消息给某个人或当前群（写操作，需主人二次确认）。' +
       '用于"帮我给张三发条消息说…""在群里通知一下…"。私发优先指定 to_user_email，可避免同名；也可用 to_user_name；发到当前群用 to_current_chat=true。' +
-      '如果用户要求"艾特/@"某人，必须填写 mention_user_names 或 mention_user_emails；不要只在正文里写普通 @名字。',
+      '如果用户要求"艾特/@"某人或某个群内机器人，必须填写 mention_user_names/mention_user_emails/mention_bot_names；不要只在正文里写普通 @名字。',
     parameters: {
       type: 'object',
       properties: {
@@ -1140,8 +1274,9 @@ const TOOLS = [
         to_current_chat: { type: 'boolean', description: '为 true 时发到当前群；与 to_user_name/to_user_email 二选一' },
         text: { type: 'string', description: '纯文本内容（与 markdown 二选一）' },
         markdown: { type: 'string', description: 'markdown 内容（与 text 二选一）' },
-        mention_user_names: { type: 'array', items: { type: 'string' }, description: '需要在消息里真正 @ 的用户姓名列表；工具会解析 open_id 并生成飞书 <at> 格式' },
+        mention_user_names: { type: 'array', items: { type: 'string' }, description: '需要在消息里真正 @ 的用户姓名列表；若通讯录找不到且是当前群聊，会继续匹配群内机器人名称' },
         mention_user_emails: { type: 'array', items: { type: 'string', format: 'email' }, description: '需要在消息里真正 @ 的用户邮箱列表；比姓名更适合处理同名' },
+        mention_bot_names: { type: 'array', items: { type: 'string' }, description: '需要在当前群聊里真正 @ 的机器人名称或 app_id（cli_xxx）列表' },
         mention_all: { type: 'boolean', description: '是否 @所有人；仅用于群聊' },
       },
       required: [],
@@ -1155,6 +1290,7 @@ const TOOLS = [
       markdown,
       mention_user_names,
       mention_user_emails,
+      mention_bot_names,
       mention_all = false,
     }, ctx) {
       if (!text && !markdown) return { error: '缺少消息内容' };
@@ -1184,13 +1320,16 @@ const TOOLS = [
       const originalContent = text ? String(text) : String(markdown);
       const explicitMentionNames = normalizeStringList(mention_user_names);
       const explicitMentionEmails = normalizeStringList(mention_user_emails);
-      const inferredMentions = (!explicitMentionNames.length && !explicitMentionEmails.length && !mention_all && to_current_chat)
+      const explicitBotNames = normalizeStringList(mention_bot_names);
+      const inferredMentions = (!explicitMentionNames.length && !explicitMentionEmails.length && !explicitBotNames.length && !mention_all && to_current_chat)
         ? inferMentionTargets(originalContent)
         : { names: [], all: false };
       const mentionResult = await resolveMessageMentions({
         mention_user_names: explicitMentionNames.length ? explicitMentionNames : inferredMentions.names,
         mention_user_emails: explicitMentionEmails,
+        mention_bot_names: explicitBotNames,
         mention_all: mention_all || inferredMentions.all,
+        chatId: ctx.chatId,
       });
       if (!mentionResult.ok) {
         if (mentionResult.needClarify) return mentionResult;
@@ -1199,7 +1338,9 @@ const TOOLS = [
       const finalContent = mentionResult.mentions.length
         ? applyMentionsToContent(originalContent, mentionResult.mentions)
         : originalContent;
-      if (text) a.push('--text', finalContent);
+      // Mentions are most reliable in Feishu text payloads. Markdown is converted to
+      // post and may render mention tags as plain text in some cases.
+      if (mentionResult.mentions.length || text) a.push('--text', finalContent);
       else a.push('--markdown', finalContent);
       a.push('--as', 'bot');
       const mentionLine = mentionResult.mentions.length
@@ -1717,4 +1858,8 @@ export const __testing = Object.freeze({
   extractImageKeysFromContent,
   applyMentionsToContent,
   inferMentionTargets,
+  resolveVisibleMentionsInContent,
+  matchBotMembersByLabel,
+  botMemberDisplayName,
+  botMentionId,
 });
