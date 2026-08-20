@@ -16,6 +16,14 @@ import readline from 'node:readline';
 import { runAgent } from './agent.mjs';
 import { assessSafety, llmConfigured } from './reply.mjs';
 import {
+  createGroupActivity,
+  groupAutonomyConfig,
+  noteGroupBotMessage,
+  noteGroupMessage,
+  shouldAutoParticipate,
+  shouldSendIdleMessage,
+} from './group-autonomy.mjs';
+import {
   sessionKey,
   buildContext,
   buildGroupContext,
@@ -71,6 +79,25 @@ const GROUP_CONTEXT_PREFETCH = (process.env.GROUP_CONTEXT_PREFETCH || 'smart').t
 const GROUP_CONTEXT_LIMIT = Number(process.env.GROUP_CONTEXT_LIMIT || 15);
 const GROUP_CONTEXT_INCLUDE_IMAGES = (process.env.GROUP_CONTEXT_INCLUDE_IMAGES || 'on').toLowerCase() !== 'off';
 const CURRENT_MESSAGE_IMAGE_LIMIT = Number(process.env.CURRENT_MESSAGE_IMAGE_LIMIT || 3);
+const GROUP_AUTONOMY = groupAutonomyConfig(process.env);
+const GROUP_IDLE_PROMPT = process.env.GROUP_IDLE_PROMPT || '群里安静一会儿了，我出来冒个泡：大家现在有什么需要我帮忙整理、查资料或者跑腿的吗？';
+const groupActivities = new Map();
+let idleSweepTimer = null;
+
+function groupActivity(chatId) {
+  const key = String(chatId || '');
+  if (!key) return createGroupActivity();
+  const activity = groupActivities.get(key) || createGroupActivity();
+  groupActivities.set(key, activity);
+  return activity;
+}
+
+function setGroupActivity(chatId, activity) {
+  const key = String(chatId || '');
+  if (!key) return activity;
+  groupActivities.set(key, activity);
+  return activity;
+}
 
 function contentPreview(text) {
   const value = String(text || '');
@@ -245,6 +272,36 @@ function isBotMentioned(d) {
   return false;
 }
 
+function eventSenderName(d = {}) {
+  return String(d.sender?.name || d.sender_name || d.operator_name || '').trim();
+}
+
+function eventSenderBotMention(d = {}) {
+  const id = String(
+    d.sender_id ||
+    d.sender?.id ||
+    d.sender?.sender_id ||
+    d.sender?.open_id ||
+    d.sender?.app_id ||
+    '',
+  ).trim();
+  const name = eventSenderName(d) || '对方机器人';
+  return id ? larkAtTag(id, name) : name;
+}
+
+function isSelfBotSender(d = {}) {
+  const ids = [
+    d.sender_id,
+    d.sender?.id,
+    d.sender?.sender_id,
+    d.sender?.open_id,
+    d.sender?.app_id,
+  ].map((item) => String(item || '').trim()).filter(Boolean);
+  if (ids.some((id) => id === BOT_OPEN_ID || id === BOT_APP_ID)) return true;
+  const name = eventSenderName(d);
+  return Boolean(!ids.length && BOT_NAME && name && name === BOT_NAME);
+}
+
 // 去掉文本里的 @机器人 占位/名字，得到用户真正说的话
 function stripMention(text, mentions) {
   let t = text || '';
@@ -277,6 +334,28 @@ async function replyMessage(messageId, text) {
   const ok = r.code === 0 && (r.json ? r.json.ok !== false : true);
   if (ok) console.log(`[reply] ✅ 已回复 ${messageId}`);
   else console.error(`[reply] ❌ 回复失败 ${messageId} (code=${r.code}): ${r.err.trim() || r.out.trim()}`);
+  return ok;
+}
+
+async function sendGroupMessage(chatId, text) {
+  const args = containsLarkAtTag(text)
+    ? [
+      'im', '+messages-send',
+      '--chat-id', chatId,
+      '--msg-type', 'post',
+      '--content', JSON.stringify(postContentFromTextWithMentions(text)),
+      '--as', 'bot',
+    ]
+    : [
+      'im', '+messages-send',
+      '--chat-id', chatId,
+      '--markdown', text,
+      '--as', 'bot',
+    ];
+  const r = await runLark(args);
+  const ok = r.code === 0 && (r.json ? r.json.ok !== false : true);
+  if (ok) console.log(`[send] ✅ 已主动发群消息 ${chatId}`);
+  else console.error(`[send] ❌ 主动发群消息失败 ${chatId} (code=${r.code}): ${r.err.trim() || r.out.trim()}`);
   return ok;
 }
 
@@ -340,6 +419,15 @@ async function replyAgentResponse(messageId, response, { chatId = '' } = {}) {
     ok = await replyMessage(messageId, part) && ok;
   }
   return ok;
+}
+
+function prefixResponseMention(response, mention = '') {
+  const prefix = String(mention || '').trim();
+  if (!prefix) return response;
+  const raw = typeof response === 'string' ? response : String(response?.text || '');
+  if (!raw.trim() || raw.trim().startsWith(prefix)) return response;
+  const text = `${prefix} ${raw}`.trim();
+  return typeof response === 'string' ? text : { ...response, text };
 }
 
 function ownerAtText() {
@@ -475,6 +563,32 @@ async function runAgentWithConfirm(text, ctx, confirmationKey, isOwner) {
   };
 }
 
+async function runGroupAgentForMessage({ text, chatId, messageId, senderId, senderName, senderProfile, isOwner, threadContext = '' }) {
+  const gKey = sessionKey({
+    chatType: 'group',
+    chatId,
+    senderId,
+    senderName,
+    senderDept: senderProfile?.department || '',
+    senderEmail: senderProfile?.email || '',
+  });
+  const gCtx = buildContext(gKey, { persist: true, query: text });
+  const sharedGroupCtx = buildGroupContext(chatId, { persist: true, query: text });
+  const response = await runAgentWithConfirm(text, {
+    isOwner,
+    senderId,
+    senderName,
+    senderDept: senderProfile?.department || '',
+    chatId,
+    messageId,
+    ownerConfirmationKey: OWNER_OPEN_ID ? `g:${chatId}:${OWNER_OPEN_ID}` : '',
+    ...gCtx,
+    ...sharedGroupCtx,
+    threadContext,
+  }, gKey.id, isOwner);
+  return { response, gKey };
+}
+
 // 处理单条消息事件
 async function handleEvent(evt) {
   // event consume 输出形如 { ok, event_key, data: {...实际字段...} }，兼容直接是字段的情况
@@ -498,42 +612,58 @@ async function handleEvent(evt) {
     }
   }
 
-  // 防止机器人回复自己 / 其它机器人，避免死循环
-  if (d.sender_type === 'bot') {
-    console.log(`[skip] 来自机器人的消息，忽略 ${messageId}`);
-    return;
-  }
-
   const chatType = d.chat_type || 'p2p';
   const rawText = d.content ?? '';
   const preview = contentPreview(rawText);
+  const senderType = d.sender_type || '';
+  const isBotSender = senderType === 'bot';
+  if (isBotSender && isSelfBotSender(d)) {
+    console.log(`[skip] 来自当前机器人的消息，忽略 ${messageId}`);
+    return;
+  }
+  if (isBotSender && chatType !== 'group') {
+    console.log(`[skip] 来自其它机器人的非群聊消息，忽略 ${messageId}`);
+    return;
+  }
 
   // 识别来访者身份：是不是主人本人（真实姓名/部门延后到确认要响应时再解析，省请求）
   const senderId = d.sender_id || '';
   const isOwner = isOwnerSender(senderId);
-  let senderName = isOwner ? OWNER_NAME : '其他用户';
+  let senderName = isOwner ? OWNER_NAME : (isBotSender ? (eventSenderName(d) || '其他机器人') : '其他用户');
   let senderProfile = null;
   // 解析访客身份（姓名+部门），带缓存；填充 senderName / senderProfile
   const resolveVisitor = async () => {
-    if (isOwner) return;
+    if (isOwner || isBotSender) return;
     senderProfile = await resolveSenderProfile(senderId);
     if (senderProfile?.name) senderName = senderProfile.name;
   };
   const whoLabel = () => isOwner
     ? '主人'
-    : `访客(${senderName}${senderProfile?.department ? ' / ' + senderProfile.department : ''})`;
+    : `${isBotSender ? '机器人' : '访客'}(${senderName}${senderProfile?.department ? ' / ' + senderProfile.department : ''})`;
 
-  // 群聊：仅当 @ 机器人时才响应
+  // 群聊：默认仅 @ 机器人时响应；开启 GROUP_AUTO_PARTICIPATE 后可按策略自动参与。
   if (chatType === 'group') {
-    if (!isBotMentioned(d)) {
-      const men = (d.mentions || []).map((m) => `${m.name}(${m.id})`).join(', ') || '无';
-      console.log(`[skip] 群聊未@我，忽略 ${messageId} <- "${preview}" | mentions=[${men}]`);
-      return;
-    }
-    const userText = stripMention(rawText, d.mentions);
-    const renderedUserText = await renderCurrentMessageText(messageId, userText, {
+    const mentioned = isBotMentioned(d);
+    let activity = setGroupActivity(d.chat_id, noteGroupMessage(groupActivity(d.chat_id), getEventTimeMs(evt, d) || Date.now()));
+    const userText = mentioned ? stripMention(rawText, d.mentions) : rawText;
+    let renderedUserText = await renderCurrentMessageText(messageId, userText, {
       includeImages: GROUP_CONTEXT_INCLUDE_IMAGES,
     });
+    if (!mentioned) {
+      const decision = shouldAutoParticipate({
+        text: renderedUserText,
+        mentioned,
+        isBotSender,
+        activity,
+        config: GROUP_AUTONOMY,
+      });
+      if (!decision.ok) {
+        const men = (d.mentions || []).map((m) => `${m.name}(${m.id})`).join(', ') || '无';
+        console.log(`[skip] 群聊未@我，忽略 ${messageId} reason=${decision.reason} <- "${preview}" | mentions=[${men}]`);
+        return;
+      }
+      renderedUserText = `（系统提示：这是群聊自动参与，不是用户直接 @ 你。请自然接一句，保持简短，不要喧宾夺主。）\n${renderedUserText}`;
+    }
 
     // 限流：访客受滑动窗口限制，主人不受限（限流在身份解析之前，省下被限流者的解析请求）
     if (!isOwner && isRateLimited(senderId)) {
@@ -541,9 +671,9 @@ async function handleEvent(evt) {
       return;
     }
     await resolveVisitor(); // 解析访客姓名+部门
-    console.log(`[recv] group@ ${whoLabel()} sender=${maskId(senderId)} msg=${messageId} <- ${contentPreview(renderedUserText)}`);
+    console.log(`[recv] ${mentioned ? 'group@' : 'group-auto'} ${whoLabel()} sender=${maskId(senderId)} msg=${messageId} <- ${contentPreview(renderedUserText)}`);
 
-    if (!isOwner) {
+    if (!isOwner && !isBotSender) {
       const handledCommand = await handleVisitorSandboxCommandRequest(messageId, renderedUserText, {
         chatId: d.chat_id,
         senderName,
@@ -565,11 +695,7 @@ async function handleEvent(evt) {
       }
     }
 
-    // 统一交给 Agent 编排：LLM 自主决定调用工具（查人/查消息/总结群聊/…）或直接对话。
-    const gKey = sessionKey({ chatType, chatId: d.chat_id, senderId, senderName, senderDept: senderProfile?.department || '', senderEmail: senderProfile?.email || '' });
     const qText = renderedUserText || '你好';
-    const gCtx = buildContext(gKey, { persist: true, query: qText }); // 主人与访客均持久化三层记忆
-    const sharedGroupCtx = buildGroupContext(d.chat_id, { persist: true, query: qText });
     let threadContext = '';
     if (shouldPrefetchGroupContext(qText)) {
       const recent = await getRecentChatContext(d.chat_id, {
@@ -580,24 +706,26 @@ async function handleEvent(evt) {
       if (recent.error) console.warn(`[context] 群聊上下文预取失败 ${messageId}: ${recent.error}`);
       else threadContext = recent.text || '';
     }
-    const response = await runAgentWithConfirm(qText, {
-      isOwner,
-      senderId,
-      senderName,
-      senderDept: senderProfile?.department || '',
+    const { response, gKey } = await runGroupAgentForMessage({
+      text: qText,
       chatId: d.chat_id,
       messageId,
-        ownerConfirmationKey: OWNER_OPEN_ID ? `g:${d.chat_id}:${OWNER_OPEN_ID}` : '',
-      ...gCtx,
-      ...sharedGroupCtx,
+      senderId,
+      senderName,
+      senderProfile,
+      isOwner,
       threadContext,
-    }, gKey.id, isOwner);
-    const answer = response.text;
-    const sent = await replyAgentResponse(messageId, response, { chatId: d.chat_id });
+    });
+    const finalResponse = (isBotSender && mentioned)
+      ? prefixResponseMention(response, eventSenderBotMention(d))
+      : response;
+    const answer = finalResponse.text;
+    const sent = await replyAgentResponse(messageId, finalResponse, { chatId: d.chat_id });
     if (!sent) {
       forgetHandled(messageId);
       return;
     }
+    activity = setGroupActivity(d.chat_id, noteGroupBotMessage(activity));
     appendTurn(gKey, qText, answer, { persist: true });
     appendGroupTurn(d.chat_id, { senderName, userText: qText, assistantText: answer, threadContext }, { persist: true });
     maintainMemory(gKey).catch((e) => console.error('[memory] 维护异常：', e.message)); // 异步，不阻塞
@@ -778,6 +906,28 @@ function scheduleCardReconnect(reason) {
   }, RECONNECT_DELAY_MS);
 }
 
+async function handleIdleGroup(chatId, activity) {
+  const decision = shouldSendIdleMessage({ activity, config: GROUP_AUTONOMY });
+  if (!decision.ok) return;
+  const text = GROUP_IDLE_PROMPT;
+  const sent = await sendGroupMessage(chatId, text);
+  if (sent) {
+    setGroupActivity(chatId, noteGroupBotMessage(activity));
+    appendGroupTurn(chatId, { senderName: BOT_NAME || 'bot', userText: '(idle)', assistantText: text, threadContext: '' }, { persist: true });
+    maintainGroupMemory(chatId).catch((e) => console.error('[memory] 群共享记忆维护异常：', e.message));
+  }
+}
+
+function startIdleSweep() {
+  if (!GROUP_AUTONOMY.autoIdleMessage || idleSweepTimer || shuttingDown) return;
+  idleSweepTimer = setInterval(() => {
+    for (const [chatId, activity] of groupActivities.entries()) {
+      handleIdleGroup(chatId, activity).catch((err) => console.error(`[idle] 主动群消息失败 ${chatId}:`, err.message));
+    }
+  }, GROUP_AUTONOMY.idleCheckMs);
+  idleSweepTimer.unref?.();
+}
+
 // 启动一次 event consume，并把 stdout 按行喂给队列
 function startConsumer() {
   if (shuttingDown || consumerChild) return;
@@ -859,8 +1009,10 @@ function stopConsumer() {
   shuttingDown = true;
   if (reconnectTimer) clearTimeout(reconnectTimer);
   if (cardReconnectTimer) clearTimeout(cardReconnectTimer);
+  if (idleSweepTimer) clearInterval(idleSweepTimer);
   reconnectTimer = null;
   cardReconnectTimer = null;
+  idleSweepTimer = null;
   try { consumerRl?.close(); } catch { /* ignore */ }
   try { consumerChild?.kill('SIGTERM'); } catch { /* ignore */ }
   try { cardConsumerRl?.close(); } catch { /* ignore */ }
@@ -898,7 +1050,7 @@ console.log(`专属主人：${OWNER_NAME}（${maskId(OWNER_OPEN_ID)}）`);
 if (!OWNER_OPEN_ID) console.warn('[bot] ⚠️ 未配置 OWNER_OPEN_ID，且自动发现失败：所有人都会按访客处理，主人专属工具不可用。请在 .env 中配置 OWNER_OPEN_ID，或确认 lark-cli user 登录态有效。');
 console.log(`能力：Agent 工具编排（读最新版 lark-cli skills 文档自主调用 lark-cli：查人/群成员/消息/总结/日历/文档/任务…）`);
 console.log(`受限 Shell：${shellEnabled() ? `已启用 / runner=${shellDockerEnabled() ? 'docker' : 'local'}` : '未启用'}（默认关闭，仅主人可用）`);
-console.log(`群聊策略：仅 @机器人 时响应${IGNORE_BACKLOG ? '；忽略启动前的历史/积压消息' : ''}`);
+console.log(`群聊策略：${GROUP_AUTONOMY.autoParticipate ? '自动参与已开启' : '仅 @机器人 时响应'}${GROUP_AUTONOMY.autoIdleMessage ? `；空闲主动消息 ${Math.round(GROUP_AUTONOMY.idleMs / 60000)}min` : ''}${IGNORE_BACKLOG ? '；忽略启动前的历史/积压消息' : ''}`);
 console.log(`安全策略：访客经安全评估(硬闸+防注入+fail-closed)；写操作仅主人且需卡片按钮或回复带确认码的「确认 ABC123」；限流 ${RATE_MAX_PER_SENDER}次/${RATE_WINDOW_MS / 1000}s/人，并发上限 ${MAX_CONCURRENT}`);
 console.log(`对话记忆：短期滑动窗口(内存) + 长期摘要 + 关键JSON(按用户落盘 data/memory)；主人与访客均享完整三层`);
 console.log('私聊：收到即回。Ctrl+C 退出。');
@@ -906,3 +1058,4 @@ console.log('====================================================');
 await discoverBotIdentity();
 startConsumer();
 startCardActionConsumer();
+startIdleSweep();

@@ -1,9 +1,14 @@
 import { randomUUID } from 'node:crypto';
+import {
+  WORKFLOW_SCHEMA_VERSION,
+  WORKFLOW_STATUSES,
+  WORKFLOW_STEP_STATUSES,
+  WORKFLOW_STEP_TYPES,
+  createWorkflowV2,
+  normalizeWorkflow,
+} from './workflow-schema.mjs';
 
-export const WORKFLOW_SCHEMA_VERSION = 1;
-export const WORKFLOW_STEP_TYPES = Object.freeze(['plan', 'tool', 'transform', 'verify', 'confirm', 'send']);
-export const WORKFLOW_STATUSES = Object.freeze(['pending', 'running', 'waiting_confirmation', 'completed', 'failed', 'canceled']);
-export const WORKFLOW_STEP_STATUSES = Object.freeze(['pending', 'running', 'waiting_confirmation', 'completed', 'failed', 'skipped']);
+export { WORKFLOW_SCHEMA_VERSION, WORKFLOW_STATUSES, WORKFLOW_STEP_STATUSES, WORKFLOW_STEP_TYPES };
 
 const STEP_TYPE_SET = new Set(WORKFLOW_STEP_TYPES);
 const STATUS_SET = new Set(WORKFLOW_STATUSES);
@@ -35,6 +40,13 @@ function normalizeStep(step, index) {
     output: step?.output ?? null,
     error: step?.error ?? null,
     requiresConfirmation: Boolean(step?.requiresConfirmation),
+    artifactIds: Array.isArray(step?.artifactIds) ? step.artifactIds.map(String) : [],
+    citationIds: Array.isArray(step?.citationIds) ? step.citationIds.map(String) : [],
+    retryCount: Math.max(0, Number(step?.retryCount) || 0),
+    timeoutMs: Math.max(0, Number(step?.timeoutMs) || 0),
+    startedAt: step?.startedAt || '',
+    endedAt: step?.endedAt || '',
+    updatedAt: step?.updatedAt || '',
   };
 }
 
@@ -43,39 +55,51 @@ export function createWorkflow({
   title = '',
   sessionKey = '',
   ownerId = '',
+  type = 'generic',
+  userGoal = '',
+  plan = {},
   steps = [],
   status = 'pending',
   currentStep = 0,
   requiresConfirmation = false,
+  artifacts = {},
+  citations = {},
+  progressEvents,
   metadata = {},
 } = {}) {
   assertKnown(status, STATUS_SET, 'workflow status');
   const normalizedSteps = Array.isArray(steps) ? steps.map(normalizeStep) : [];
   const now = nowIso();
-  return {
+  return createWorkflowV2({
     schemaVersion: WORKFLOW_SCHEMA_VERSION,
-    workflowId: String(workflowId),
-    title: String(title || ''),
+    workflowId,
+    type,
+    title,
     status,
     steps: normalizedSteps,
-    currentStep: Math.max(0, Math.min(Number(currentStep) || 0, Math.max(0, normalizedSteps.length - 1))),
-    requiresConfirmation: Boolean(requiresConfirmation),
-    resumeToken: resumeToken(),
-    sessionKey: String(sessionKey || ''),
-    ownerId: String(ownerId || ''),
-    metadata: metadata && typeof metadata === 'object' ? metadata : {},
+    currentStep,
+    requiresConfirmation,
+    sessionKey,
+    ownerId,
+    userGoal,
+    plan,
+    artifacts,
+    citations,
+    progressEvents,
+    metadata,
     createdAt: now,
     updatedAt: now,
-  };
+  });
 }
 
 export function currentWorkflowStep(workflow) {
-  if (!workflow || !Array.isArray(workflow.steps)) return null;
-  return workflow.steps[Number(workflow.currentStep) || 0] || null;
+  const normalized = normalizeWorkflow(workflow);
+  return normalized.steps[Number(normalized.currentStep) || 0] || null;
 }
 
 export function updateWorkflowStep(workflow, stepRef, patch = {}) {
-  const steps = Array.isArray(workflow?.steps) ? workflow.steps : [];
+  const current = normalizeWorkflow(workflow);
+  const steps = current.steps;
   const index = typeof stepRef === 'number'
     ? stepRef
     : steps.findIndex((step) => step.id === stepRef);
@@ -86,7 +110,7 @@ export function updateWorkflowStep(workflow, stepRef, patch = {}) {
     ? { ...step, ...patch, status: nextStatus }
     : step));
   return {
-    ...workflow,
+    ...current,
     steps: nextSteps,
     currentStep: index,
     updatedAt: nowIso(),
@@ -95,10 +119,11 @@ export function updateWorkflowStep(workflow, stepRef, patch = {}) {
 
 export function requireWorkflowConfirmation(workflow, { reason = '', actionId = '' } = {}) {
   const token = resumeToken();
-  const step = currentWorkflowStep(workflow);
+  const current = normalizeWorkflow(workflow);
+  const step = currentWorkflowStep(current);
   const next = step
-    ? updateWorkflowStep(workflow, step.id, { status: 'waiting_confirmation', requiresConfirmation: true })
-    : { ...workflow, updatedAt: nowIso() };
+    ? updateWorkflowStep(current, step.id, { status: 'waiting_confirmation', requiresConfirmation: true })
+    : { ...current, updatedAt: nowIso() };
   return {
     ...next,
     status: 'waiting_confirmation',
@@ -115,14 +140,15 @@ export function requireWorkflowConfirmation(workflow, { reason = '', actionId = 
 
 export function resumeWorkflow(workflow, token) {
   if (!workflow) return { ok: false, reason: 'workflow 不存在' };
-  if (!workflow.requiresConfirmation) return { ok: false, reason: 'workflow 当前不需要确认' };
-  if (String(token || '').trim().toUpperCase() !== String(workflow.resumeToken || '').trim().toUpperCase()) {
+  const current = normalizeWorkflow(workflow);
+  if (!current.requiresConfirmation) return { ok: false, reason: 'workflow 当前不需要确认' };
+  if (String(token || '').trim().toUpperCase() !== String(current.resumeToken || '').trim().toUpperCase()) {
     return { ok: false, reason: 'workflow resumeToken 不匹配' };
   }
-  const step = currentWorkflowStep(workflow);
+  const step = currentWorkflowStep(current);
   const next = step
-    ? updateWorkflowStep(workflow, step.id, { status: 'running', requiresConfirmation: false })
-    : { ...workflow, updatedAt: nowIso() };
+    ? updateWorkflowStep(current, step.id, { status: 'running', requiresConfirmation: false })
+    : { ...current, updatedAt: nowIso() };
   return {
     ok: true,
     workflow: {
@@ -136,12 +162,13 @@ export function resumeWorkflow(workflow, token) {
 }
 
 export function advanceWorkflow(workflow) {
-  const steps = Array.isArray(workflow?.steps) ? workflow.steps : [];
-  const current = Number(workflow?.currentStep) || 0;
+  const normalized = normalizeWorkflow(workflow);
+  const steps = normalized.steps;
+  const current = Number(normalized.currentStep) || 0;
   const nextIndex = steps.findIndex((step, index) => index > current && !['completed', 'skipped'].includes(step.status));
   if (nextIndex < 0) {
     return {
-      ...workflow,
+      ...normalized,
       status: 'completed',
       requiresConfirmation: false,
       currentStep: Math.max(0, steps.length - 1),
@@ -149,7 +176,7 @@ export function advanceWorkflow(workflow) {
     };
   }
   return {
-    ...workflow,
+    ...normalized,
     status: 'running',
     currentStep: nextIndex,
     updatedAt: nowIso(),
@@ -157,8 +184,9 @@ export function advanceWorkflow(workflow) {
 }
 
 export function failWorkflow(workflow, error) {
+  const normalized = normalizeWorkflow(workflow);
   return {
-    ...workflow,
+    ...normalized,
     status: 'failed',
     error: typeof error === 'string' ? error : String(error?.message || error || 'workflow failed'),
     updatedAt: nowIso(),

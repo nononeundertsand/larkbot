@@ -69,6 +69,16 @@
   - 新增 `src/reply-parts.mjs`，普通回答可按空行拆成多条飞书回复
   - 代码块、表格、列表、确认码和命令输出保持单条，避免格式被拆坏
   - 可通过 `MULTI_REPLY_ENABLED=off` 回退单条回复，`MULTI_REPLY_MAX_PARTS` 控制最多拆分条数
+- P3-2 体验优化：群聊自动参与基础版已完成。
+  - 默认关闭，可通过 `GROUP_AUTO_PARTICIPATE=on` 允许未 @ 自动接话
+  - 支持 `GROUP_AUTO_MODE=conservative|normal|chatty` 控制活跃度
+  - 可通过 `GROUP_IDLE_AUTO_MESSAGE=on` 允许群长时间空闲后主动发消息
+  - 已加入冷却、每小时上限、连续聊天触发、低信号过滤和空闲判断
+- W0 复杂任务接口设计：已完成第一版。
+  - 新增 `src/workflow-schema.mjs`
+  - workflow schema 升级到 v2，兼容 v1
+  - 已定义 artifact/citation/progress event 和取消/重试/状态转换规则
+  - 详见 `COMPLEX_WORKFLOW_UPGRADE_PLAN.md`
 
 ## 当前基线
 

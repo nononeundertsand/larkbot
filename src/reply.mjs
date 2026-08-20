@@ -384,6 +384,21 @@ function hardRuleRisky(text) {
   return null; // 硬规则未命中，交给模型进一步判断
 }
 
+const OWNER_PROFILE_SAFE_RE =
+  /(主人|owner|刘老师|用户本人).{0,24}(喜好|偏好|爱好|口味|习惯|风格|性格|脾气|评价|印象|特点|人设|画风)|(?:喜好|偏好|爱好|口味|习惯|风格|性格|评价|印象).{0,24}(主人|owner|刘老师|用户本人)/i;
+const OWNER_PROFILE_SENSITIVE_RE =
+  /(私聊|私信|个人消息|聊天记录|日程|会议|邮件|邮箱|任务|待办|审批|文档权限|权限|token|密钥|密码|凭证|私钥|配置|环境变量|\.env|客户|合同|薪资|绩效|OKR|业务数据|工作敏感)/i;
+const OWNER_PRIVATE_RESOURCE_RE =
+  /(主人|owner|刘老师|用户本人).{0,24}(私聊|私信|个人消息|聊天记录|日程|会议|邮件|邮箱|任务|待办|审批|文档权限|权限|token|密钥|密码|凭证|私钥|配置|环境变量|\.env|客户|合同|薪资|绩效|OKR|业务数据|工作敏感)|(?:私聊|私信|个人消息|聊天记录|日程|会议|邮件|邮箱|任务|待办|审批|文档权限|权限|客户|合同|薪资|绩效|OKR|业务数据|工作敏感).{0,24}(主人|owner|刘老师|用户本人)/i;
+
+function looksLikeSafeOwnerProfileQuestion(text) {
+  return OWNER_PROFILE_SAFE_RE.test(text) && !OWNER_PROFILE_SENSITIVE_RE.test(text);
+}
+
+function looksLikeOwnerPrivateResourceRequest(text) {
+  return OWNER_PRIVATE_RESOURCE_RE.test(text);
+}
+
 export async function assessSafety(userText) {
   const text = (userText || '').trim();
   if (!text) return { risky: false, reason: '' };
@@ -391,6 +406,8 @@ export async function assessSafety(userText) {
   // 1) 硬闸：命中敏感词或注入信号，直接拒绝，不给模型翻案机会
   const hard = hardRuleRisky(text);
   if (hard) return hard;
+  if (looksLikeOwnerPrivateResourceRequest(text)) return { risky: true, reason: '请求涉及主人私密或工作敏感资源' };
+  if (looksLikeSafeOwnerProfileQuestion(text)) return { risky: false, reason: '普通主人偏好/风格评价，不涉及敏感权限或私密数据' };
 
   // 未配置 LLM：无法进一步判断，访客场景 fail-closed 交由调用方处理，这里放行硬闸外内容
   if (!llmConfigured()) return { risky: false, reason: '' };
@@ -415,7 +432,8 @@ export async function assessSafety(userText) {
             '访客请求在无网络、无项目目录挂载的 Python 沙箱中运行普通代码并返回 stdout/stderr；' +
             '访客查询/总结【当前这个群】里大家的公开讨论；' +
             '访客查询【自己】发的消息、自己的聊天记录、自己的信息；' +
-            '查询其他同事（非主人）的公开通讯录信息（部门/邮箱/职位）。\n' +
+            '查询其他同事（非主人）的公开通讯录信息（部门/邮箱/职位）；' +
+            `评价${OWNER_NAME}的普通喜好、偏好、性格、沟通风格、公开印象，只要不索取工作敏感权限内容、私聊、日程、邮件、凭证或配置。\n` +
             '只返回一个 JSON：{"risky": true/false, "reason": "简短中文原因"}。不要输出其它内容。',
         },
         { role: 'user', content: wrapUntrusted(text) },

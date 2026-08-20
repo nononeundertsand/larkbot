@@ -26,6 +26,16 @@
 - 记忆系统：用户记忆、群共享记忆、知识图谱、冲突治理
 - 评估基础：Node test + 对话级 eval fixtures
 
+## 实施状态
+
+- W0 基线对齐：复杂任务接口设计已完成第一版。
+  - 新增 `src/workflow-schema.mjs`
+  - workflow schema 升级到 v2，兼容读取 v1 数据
+  - 定义 artifact / citation / progress event 数据结构
+  - 定义 workflow 状态转换、取消、重试语义
+  - `RuntimeStateStore` 保存和加载 workflow 时会规范化为 v2
+  - 已补充 `test/workflow-schema.test.mjs`
+
 核心短板：
 
 - 还没有稳定的任务规划器，不会把复杂目标拆成可恢复步骤。

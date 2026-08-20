@@ -137,7 +137,10 @@ test('运行状态持久化：workflow 可跨实例恢复、暂停确认并继�
 
     const restored = new RuntimeStateStore({ file });
     workflow = restored.getWorkflow(workflow.workflowId);
+    assert.equal(workflow.schemaVersion, 2);
     assert.equal(workflow.title, '整理会议并发送报告');
+    assert.deepEqual(workflow.artifacts, {});
+    assert.deepEqual(workflow.citations, {});
     assert.equal(restored.listWorkflows({ sessionKey: 'p:owner' }).length, 1);
 
     workflow = updateWorkflowStep(workflow, 'plan', { status: 'completed', output: { ok: true } });

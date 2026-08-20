@@ -97,6 +97,7 @@
 | **Shell 沙箱与命令审核** | Shell 默认关闭；开启后采用结构化 argv、敏感路径拒绝、隔离 HOME/TMP、超时/输出上限和确认码机制；本机 runner 仍使用严格 allowlist，Docker runner 可让通用命令进入确认链路，并默认不挂载 workspace。`ping` 等网络诊断命令会限制公网目标和次数。 |
 | **访客命令审批** | 群聊访客 @ 机器人发送命令类内容时，bot 会先解析命令、解释功能和风险，再 @ 主人发送确认/取消卡片；确认后只在不挂载 workspace 的临时 Docker 沙箱中执行。`apt install` 类命令会转为临时容器内安装，`ping` 会自动限制包数量；`rm` 等删除/高风险写入命令、复杂 shell 语法、管道和重定向不进入审批链。 |
 | **多条回复** | 普通回答支持按空行拆成多条飞书回复，让群聊互动更像真人连续发言；代码块、表格、列表、确认码和命令输出会保持单条，避免格式被拆坏。 |
+| **群聊自动参与** | 默认关闭；`GROUP_AUTO_PARTICIPATE=on` 后，群里未 @ 机器人也可按活跃度模式自动接话。`normal` 模式会按话题信号或连续聊天参与，`chatty` 更积极；`GROUP_IDLE_AUTO_MESSAGE=on` 后，群长时间空闲可主动发一条轻量消息。两者都有冷却、每小时上限和噪声过滤。 |
 | **访客 Python 沙箱** | 访客只可用 `run_python_code`，不开放 Shell；该工具不挂载 workspace、禁网络、只返回 stdout/stderr，运行结果视为不可信外部数据。 |
 | **网络 SSRF 防护** | 每一跳重定向都重新校验协议、DNS/IP 和内网段；流式限制响应体，带鉴权的内网请求禁止跨主机重定向。 |
 | **限流防刷** | 访客 5 次/60s/人；全局并发上限 3。主人不受限。 |
@@ -191,6 +192,8 @@ tail -f /tmp/larkbot.log
 | `MEMORY_CONTEXT_BUDGET_CHARS` / `MEMORY_RELEVANT_LIMIT` | 记忆 | prompt 记忆上下文预算与每轮最多注入的相关长期记忆条数 |
 | `MEMORY_TEMP_TTL_MS` / `MEMORY_TASK_TTL_MS` / `MEMORY_DECISION_TTL_MS` / `MEMORY_STALE_MS` | 记忆 | 临时、任务、决策、长期未使用记忆的遗忘策略 |
 | `GROUP_CONTEXT_PREFETCH` / `GROUP_CONTEXT_LIMIT` / `GROUP_CONTEXT_INCLUDE_IMAGES` | 群聊 | 群聊 @ 时是否预取最近上文、读取条数、是否识别前文图片；图片识别默认 `on` |
+| `GROUP_AUTO_PARTICIPATE` / `GROUP_AUTO_MODE` / `GROUP_AUTO_COOLDOWN_MS` / `GROUP_AUTO_MAX_PER_HOUR` / `GROUP_AUTO_MIN_MESSAGES_SINCE_BOT` | 群聊 | 是否允许未 @ 自动参与（默认 `off`）/ 活跃度档位 `conservative|normal|chatty`（默认 `normal`）/ 自动接话冷却 / 每小时最多主动回复次数 / 距离上次 bot 发言至少多少条群消息 |
+| `GROUP_IDLE_AUTO_MESSAGE` / `GROUP_IDLE_MS` / `GROUP_IDLE_CHECK_MS` / `GROUP_IDLE_PROMPT` | 群聊 | 是否允许群空闲主动发消息（默认 `off`）/ 空闲阈值 / 检查周期 / 主动消息文本 |
 | `CURRENT_MESSAGE_IMAGE_LIMIT` | 多模态 | 当前 @ 消息或私聊消息里最多识别多少张图片，默认 3 |
 | `RATE_MAX_PER_SENDER` / `RATE_WINDOW_MS` / `MAX_CONCURRENT` | 限流 | 访客限流与并发 |
 | `CONFIRM_TTL_MS` | 安全 | 写操作确认超时，默认 5 分钟 |

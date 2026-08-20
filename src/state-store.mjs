@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { normalizeWorkflow } from './workflow-schema.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const DEFAULT_STATE_FILE = join(__dirname, '..', '.local', 'state', 'runtime-state.json');
@@ -78,7 +79,12 @@ export class RuntimeStateStore {
         agentRuns: Array.isArray(data.agentRuns) ? data.agentRuns : [],
         toolCalls: Array.isArray(data.toolCalls) ? data.toolCalls : [],
         memoryJobs: Array.isArray(data.memoryJobs) ? data.memoryJobs : [],
-        workflows: data.workflows && typeof data.workflows === 'object' && !Array.isArray(data.workflows) ? data.workflows : {},
+        workflows: data.workflows && typeof data.workflows === 'object' && !Array.isArray(data.workflows)
+          ? Object.fromEntries(Object.entries(data.workflows).map(([id, workflow]) => {
+            const normalized = normalizeWorkflow({ workflowId: id, ...workflow });
+            return [normalized.workflowId, normalized];
+          }))
+          : {},
       };
       this.pruneAll({ save: false });
     } catch (err) {
@@ -223,10 +229,11 @@ export class RuntimeStateStore {
     const workflowId = String(cloned?.workflowId || '').trim();
     if (!cloned || !workflowId) return false;
     const now = new Date().toISOString();
+    const normalized = normalizeWorkflow(cloned);
     this.data.workflows[workflowId] = {
-      ...cloned,
+      ...normalized,
       workflowId,
-      createdAt: cloned.createdAt || now,
+      createdAt: normalized.createdAt || now,
       updatedAt: now,
     };
     this.pruneWorkflows({ save: false });
